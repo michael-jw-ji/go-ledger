@@ -4,3 +4,4 @@
 coverage.out
 node_modules/
 web/dist/
+.playwright-mcp/

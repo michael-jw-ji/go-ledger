@@ -19,6 +19,14 @@ A double-entry payments ledger in Go and Postgres. Work in progress.
 
 Set the number of transfers with `LEDGER_PROP_ITERS=10000 make test-integration`.
 
+**Test console (`web/`):** a React + TypeScript dashboard for trying the API by hand. It covers accounts, two-leg and multi-leg transfers with a balance preview, entry history with a load-more cursor, reversals, and a request log that shows each idempotency key and replay. Its idempotency lab can resend a request with the same key or fire the same request twice at once.
+
+```sh
+make web-install   # once
+make web           # http://localhost:5173, with make run in another terminal
+make web-test      # Vitest + Testing Library, including a double-click-posts-once test
+```
+
 ## Run
 
 ```sh
