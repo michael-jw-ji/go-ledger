@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { formatMoney } from './money'
 import { useRequestLog } from './log'
-import { useAccounts, useHealth } from './queries'
+import { useAccounts, useHealth, useReconciliation } from './queries'
 import { AccountsPanel } from './components/AccountsPanel'
 import { TransferForm } from './components/TransferForm'
 import { LedgerPanel } from './components/LedgerPanel'
@@ -14,6 +14,7 @@ export default function App() {
   const accountsQ = useAccounts()
   const accounts = useMemo(() => accountsQ.data ?? [], [accountsQ.data])
   const log = useRequestLog()
+  const recon = useReconciliation()
 
   const [tab, setTab] = useState<Tab>('accounts')
   const [accountId, setAccountId] = useState<number | null>(null)
@@ -91,9 +92,23 @@ export default function App() {
           <div className="hint">Σ CREDIT − Σ DEBIT {trial.ok ? '· BALANCED' : '· DRIFT!'}</div>
         </div>
         <div className="metric">
-          <div className="label">Requests</div>
-          <div className="value">{log.length}</div>
-          <div className="hint">THIS SESSION</div>
+          <div className="label">Reconciliation</div>
+          {recon.data ? (
+            <>
+              <div className={`value${recon.data.mismatches.length === 0 ? ' accent' : ''}`}>
+                {recon.data.mismatches.length === 0 ? 'CLEAN' : `${recon.data.mismatches.length} OFF`}
+              </div>
+              <div className="hint">
+                RUN #{recon.data.run_id} · {recon.data.accounts_checked} ACCOUNTS ·{' '}
+                {new Date(recon.data.finished_at).toLocaleTimeString()}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="value">—</div>
+              <div className="hint">{recon.isPending ? 'LOADING' : 'NO RUN YET'}</div>
+            </>
+          )}
         </div>
         <div className="metric">
           <div className="label">Replays served</div>

@@ -19,6 +19,21 @@ A double-entry payments ledger in Go and Postgres. Work in progress.
 
 Set the number of transfers with `LEDGER_PROP_ITERS=10000 make test-integration`.
 
+**Done (milestone 3):**
+- Prometheus metrics at `GET /metrics`:
+  - request latency by route
+  - transfers by outcome
+  - idempotency lookups by result
+  - row-lock wait and transaction time
+  - pgxpool stats
+- Reconciliation job (every 60s; `RECON_INTERVAL` changes it) and a `make recon` one-off.
+  - It reads one REPEATABLE READ snapshot and checks three things: every cached balance and `lock_version` against the entries, that every transfer nets to zero, and that debits equal credits per currency.
+  - Results go to `ledger_reconciliation_mismatches` (target 0), the `reconciliation_runs` table and `GET /reconciliation`.
+  - A test corrupts one balance with raw SQL and requires exactly one finding.
+- `make obs` starts Prometheus (:9090, with alert rules) and Grafana (:3000, provisioned dashboard).
+- k6 baselines (`make load-steady`, `make load-hot`). [docs/results.md](docs/results.md) has the numbers. The steady test runs 300 transfers/s with a 32 ms p99. Sending 90% of those transfers to one merchant account pushes the p99 to 882 ms on that row lock.
+- CI on GitHub Actions: gofmt, golangci-lint, unit tests, and integration tests with `-race`, plus the web typecheck, tests and build.
+
 **Test console (`web/`):** a React + TypeScript dashboard for trying the API by hand. It covers accounts, two-leg and multi-leg transfers with a balance preview, entry history with a load-more cursor, reversals, and a request log that shows each idempotency key and replay. Its idempotency lab can resend a request with the same key or fire the same request twice at once.
 
 ```sh
@@ -35,6 +50,10 @@ make run         # API on :8088
 make test        # unit tests
 make test-integration   # Testcontainers (needs Docker)
 make lint
+make recon       # one-off reconciliation, exits 1 on mismatches
+make obs         # Prometheus :9090, Grafana :3000
+make load-steady # k6 via Docker; RATE=500 DURATION=2m to override
+make load-hot
 ```
 
 ## API
@@ -47,5 +66,7 @@ make lint
 | `POST` | `/transfers` | `Idempotency-Key` header required. Body: `{entries: [{account_id, direction, amount}]}` or `{debit_account_id, credit_account_id, amount}` |
 | `GET` | `/transfers/{id}` | |
 | `POST` | `/transfers/{id}/reverse` | `Idempotency-Key` header required |
+| `GET` | `/reconciliation` | latest reconciliation run |
+| `GET` | `/metrics` | Prometheus |
 
 Amounts are integer minor units (cents).

@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type Account } from './api'
+import { api, ApiError, type Account } from './api'
 
 export function useAccounts() {
   return useQuery({
@@ -17,6 +17,22 @@ export function useHealth() {
     },
     refetchInterval: 5000,
     retry: false,
+  })
+}
+
+/** The latest reconciliation run; null until the first one finishes. */
+export function useReconciliation() {
+  return useQuery({
+    queryKey: ['reconciliation'],
+    queryFn: async () => {
+      try {
+        return (await api.reconciliation()).data
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return null
+        throw e
+      }
+    },
+    refetchInterval: 15000,
   })
 }
 

@@ -45,6 +45,23 @@ export type TransferBody =
   | { entries: Leg[] }
   | { debit_account_id: number; credit_account_id: number; amount: number }
 
+export interface ReconMismatch {
+  kind: 'account' | 'transfer' | 'trial_balance'
+  account_id?: number
+  transfer_id?: string
+  currency?: string
+  cached: number
+  computed: number
+}
+
+export interface Reconciliation {
+  run_id: number
+  started_at: string
+  finished_at: string
+  accounts_checked: number
+  mismatches: ReconMismatch[]
+}
+
 export interface ApiResult<T> {
   data: T
   status: number
@@ -131,6 +148,7 @@ export const api = {
     return request<{ entries: Entry[]; next_cursor: string | null }>(
       'GET', `/accounts/${accountId}/entries?${q}`, { silent: true })
   },
+  reconciliation: () => request<Reconciliation>('GET', '/reconciliation', { silent: true }),
   getTransfer: (id: string) => request<Transfer>('GET', `/transfers/${id}`, { silent: true }),
   createTransfer: (body: TransferBody, key: string) =>
     request<Transfer>('POST', '/transfers', { body, key }),

@@ -1,0 +1,19 @@
+groups:
+  - name: ledger
+    rules:
+      # Cached state disagrees with the entries. Never expected; page someone.
+      - alert: LedgerReconciliationMismatch
+        expr: sum(ledger_reconciliation_mismatches) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "Reconciliation found {{ $value }} mismatches"
+          description: "Run `ledger recon` and check reconciliation_runs.details for the accounts involved."
+
+      # A detective control that stopped running detects nothing.
+      - alert: LedgerReconciliationStale
+        expr: time() - ledger_reconciliation_last_success_timestamp > 300
+        labels:
+          severity: ticket
+        annotations:
+          summary: "No successful reconciliation for 5 minutes"

@@ -263,6 +263,8 @@ func runProperty(t *testing.T, flushRedis bool) {
 		t.Fatalf("signed balance sum drifted: %d -> %d", startSum, got)
 	}
 	assertBalancesMatchEntries(t, ids)
+	// The production reconciliation job must agree.
+	assertReconClean(t)
 
 	t.Logf("%d transfers in %s: %d posted, %d rejected; %d requests, %d replayed, %d got 409; %d redis flushes",
 		len(ops), elapsed.Round(time.Millisecond), posted, rejected,

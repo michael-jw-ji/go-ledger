@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -17,11 +18,29 @@ import (
 
 // Service is the ledger's write and read API over Postgres.
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	hooks Hooks
+}
+
+// Hooks let a caller observe the service without the ledger package
+// depending on a metrics library. Any hook may be nil.
+type Hooks struct {
+	// OnTransfer is called once per transfer attempt that reached the
+	// database, with its outcome ("posted", "rejected", "replayed",
+	// "conflict" or "error") and how long it took.
+	OnTransfer func(outcome string, took time.Duration)
+	// OnLockWait is called with the time spent acquiring the account row
+	// locks of one transfer.
+	OnLockWait func(took time.Duration)
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool}
+}
+
+// WithHooks returns a copy of the service that reports to h.
+func (s *Service) WithHooks(h Hooks) *Service {
+	return &Service{pool: s.pool, hooks: h}
 }
 
 const accountCols = `id, name, currency, normal_balance, allow_negative, balance, lock_version, created_at`
@@ -110,6 +129,24 @@ func (s *Service) ReverseTransfer(ctx context.Context, id uuid.UUID, idempotency
 //  3. On a business-rule failure, roll back to the savepoint and record the
 //     transfer as rejected instead, so the rejection is idempotent too.
 func (s *Service) post(ctx context.Context, key string, hash []byte, legs []Leg, reverses *uuid.UUID) (Transfer, error) {
+	start := time.Now()
+	t, err := s.postTx(ctx, key, hash, legs, reverses)
+	if s.hooks.OnTransfer != nil {
+		outcome := string(t.Status)
+		switch {
+		case errors.Is(err, ErrAlreadyReversed), errors.Is(err, ErrIdempotencyMismatch):
+			outcome = "conflict"
+		case err != nil:
+			outcome = "error"
+		case t.Replayed:
+			outcome = "replayed"
+		}
+		s.hooks.OnTransfer(outcome, time.Since(start))
+	}
+	return t, err
+}
+
+func (s *Service) postTx(ctx context.Context, key string, hash []byte, legs []Leg, reverses *uuid.UUID) (Transfer, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Transfer{}, err
@@ -138,7 +175,7 @@ func (s *Service) post(ctx context.Context, key string, hash []byte, legs []Leg,
 	if err != nil {
 		return Transfer{}, err
 	}
-	entries, code, err := applyLegs(ctx, sp, t.ID, legs)
+	entries, code, err := s.applyLegs(ctx, sp, t.ID, legs)
 	if err != nil {
 		return Transfer{}, err
 	}
@@ -169,7 +206,7 @@ func (s *Service) post(ctx context.Context, key string, hash []byte, legs []Leg,
 	return t, nil
 }
 
-func applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID, legs []Leg) ([]Entry, ErrorCode, error) {
+func (s *Service) applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID, legs []Leg) ([]Entry, ErrorCode, error) {
 	ids := make([]int64, 0, len(legs))
 	for _, l := range legs {
 		ids = append(ids, l.AccountID)
@@ -184,6 +221,7 @@ func applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID, legs []Leg)
 		balance       int64
 		delta, n      int64
 	}
+	lockStart := time.Now()
 	rows, err := tx.Query(ctx, `
 		SELECT id, currency, normal_balance, allow_negative, balance
 		FROM accounts WHERE id = ANY($1)
@@ -204,6 +242,9 @@ func applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID, legs []Leg)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, "", err
+	}
+	if s.hooks.OnLockWait != nil {
+		s.hooks.OnLockWait(time.Since(lockStart))
 	}
 	if len(accts) != len(ids) {
 		return nil, CodeAccountNotFound, nil

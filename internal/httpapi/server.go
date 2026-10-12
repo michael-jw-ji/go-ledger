@@ -31,8 +31,9 @@ type Server struct {
 }
 
 // New builds the API. idem may be nil, in which case idempotency relies on
-// the Postgres backstop alone.
-func New(svc *ledger.Service, log *slog.Logger, idem *idempotency.Middleware) http.Handler {
+// the Postgres backstop alone. The mux is returned so callers can mount more
+// routes (metrics, recon) and resolve route patterns for instrumentation.
+func New(svc *ledger.Service, log *slog.Logger, idem *idempotency.Middleware) *http.ServeMux {
 	s := &Server{svc: svc, log: log}
 	keyed := func(h http.HandlerFunc) http.Handler {
 		if idem == nil {
