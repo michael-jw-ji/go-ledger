@@ -7,12 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/michael-jw-ji/go-ledger/internal/httpapi"
 )
 
 func do(t *testing.T, srv *httptest.Server, method, path, key, body string) (*http.Response, map[string]any) {
@@ -44,8 +41,8 @@ func errCode(body map[string]any) string {
 }
 
 func TestHTTPTransferLifecycle(t *testing.T) {
-	srv := httptest.NewServer(httpapi.New(svc, slog.New(slog.NewTextHandler(io.Discard, nil))))
-	defer srv.Close()
+	// No Redis: this exercises the Postgres backstop on its own.
+	srv, _ := newServer(t, nil)
 	funding, alice := newAccount(t, true), newAccount(t, false)
 
 	body := fmt.Sprintf(`{"debit_account_id": %d, "credit_account_id": %d, "amount": 700}`, funding.ID, alice.ID)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
 )
 
@@ -20,8 +21,8 @@ const (
 	maxBodyBytes      = 1 << 20
 	defaultPageSize   = 50
 	maxPageSize       = 500
-	idempotencyHeader = "Idempotency-Key"
-	replayedHeader    = "Idempotent-Replayed"
+	idempotencyHeader = idempotency.Header
+	replayedHeader    = idempotency.ReplayedHeader
 )
 
 type Server struct {
@@ -29,17 +30,25 @@ type Server struct {
 	log *slog.Logger
 }
 
-func New(svc *ledger.Service, log *slog.Logger) http.Handler {
+// New builds the API. idem may be nil, in which case idempotency relies on
+// the Postgres backstop alone.
+func New(svc *ledger.Service, log *slog.Logger, idem *idempotency.Middleware) http.Handler {
 	s := &Server{svc: svc, log: log}
+	keyed := func(h http.HandlerFunc) http.Handler {
+		if idem == nil {
+			return h
+		}
+		return idem.Wrap(h)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("POST /accounts", s.createAccount)
 	mux.HandleFunc("GET /accounts", s.listAccounts)
 	mux.HandleFunc("GET /accounts/{id}", s.getAccount)
 	mux.HandleFunc("GET /accounts/{id}/entries", s.listEntries)
-	mux.HandleFunc("POST /transfers", s.createTransfer)
+	mux.Handle("POST /transfers", keyed(s.createTransfer))
 	mux.HandleFunc("GET /transfers/{id}", s.getTransfer)
-	mux.HandleFunc("POST /transfers/{id}/reverse", s.reverseTransfer)
+	mux.Handle("POST /transfers/{id}/reverse", keyed(s.reverseTransfer))
 	return mux
 }
 

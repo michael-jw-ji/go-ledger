@@ -7,16 +7,23 @@ package integration
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
+	"net/http/httptest"
 	"os"
 	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
+	"github.com/michael-jw-ji/go-ledger/internal/httpapi"
+	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
 	"github.com/michael-jw-ji/go-ledger/migrations"
 )
@@ -24,6 +31,7 @@ import (
 var (
 	pool *pgxpool.Pool
 	svc  *ledger.Service
+	rdb  *redis.Client
 )
 
 func TestMain(m *testing.M) {
@@ -43,6 +51,25 @@ func run(m *testing.M) int {
 		return 1
 	}
 	defer testcontainers.TerminateContainer(pg) //nolint:errcheck
+
+	rc, err := tcredis.Run(ctx, "redis:7-alpine")
+	if err != nil {
+		log.Printf("start redis: %v", err)
+		return 1
+	}
+	defer testcontainers.TerminateContainer(rc) //nolint:errcheck
+	redisURL, err := rc.ConnectionString(ctx)
+	if err != nil {
+		log.Printf("redis url: %v", err)
+		return 1
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Printf("parse redis url: %v", err)
+		return 1
+	}
+	rdb = redis.NewClient(opts)
+	defer rdb.Close() //nolint:errcheck
 
 	dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
@@ -72,6 +99,23 @@ func run(m *testing.M) int {
 
 	svc = ledger.NewService(pool)
 	return m.Run()
+}
+
+func quietLog() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// newServer serves the full API. With a nil client it runs without the
+// Redis layer, relying on the Postgres backstop alone.
+func newServer(t *testing.T, client *redis.Client) (*httptest.Server, *idempotency.Middleware) {
+	t.Helper()
+	var idem *idempotency.Middleware
+	if client != nil {
+		idem = idempotency.NewMiddleware(idempotency.NewStore(client), quietLog())
+	}
+	srv := httptest.NewServer(httpapi.New(svc, quietLog(), idem))
+	t.Cleanup(srv.Close)
+	return srv, idem
 }
 
 var seq atomic.Int64

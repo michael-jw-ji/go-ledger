@@ -93,7 +93,7 @@ func (s *Service) ReverseTransfer(ctx context.Context, id uuid.UUID, idempotency
 	}
 	legs := make([]Leg, len(orig.Entries))
 	for i, e := range orig.Entries {
-		legs[i] = Leg{AccountID: e.AccountID, Direction: e.Direction.opposite(), Amount: e.Amount}
+		legs[i] = Leg{AccountID: e.AccountID, Direction: e.Direction.Opposite(), Amount: e.Amount}
 	}
 	key := "reverse:" + id.String() + ":" + idempotencyKey
 	hash := sha256.Sum256([]byte("reverse:" + id.String()))

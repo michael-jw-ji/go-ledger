@@ -22,7 +22,7 @@ const (
 
 func (s Side) valid() bool { return s == Debit || s == Credit }
 
-func (s Side) opposite() Side {
+func (s Side) Opposite() Side {
 	if s == Debit {
 		return Credit
 	}

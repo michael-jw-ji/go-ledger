@@ -13,8 +13,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/michael-jw-ji/go-ledger/internal/httpapi"
+	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
 	"github.com/michael-jw-ji/go-ledger/migrations"
 )
@@ -47,9 +49,21 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	redisOpts, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
+	if err != nil {
+		return err
+	}
+	rdb := redis.NewClient(redisOpts)
+	defer rdb.Close() //nolint:errcheck
+	// Redis is an optimization, so the server starts without it.
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Warn("redis unavailable, idempotency falls back to postgres", "err", err)
+	}
+	idem := idempotency.NewMiddleware(idempotency.NewStore(rdb), log)
+
 	srv := &http.Server{
 		Addr:              env("ADDR", ":8088"),
-		Handler:           httpapi.New(ledger.NewService(pool), log),
+		Handler:           httpapi.New(ledger.NewService(pool), log, idem),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
