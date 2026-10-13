@@ -9,7 +9,7 @@ A double-entry payments ledger in Go and Postgres, built to show payments correc
 - **Reliable events.** A transactional outbox writes a `transfer.posted` event in the same transaction as the money movement. A worker publishes it to a Redis stream at least once, so no posted transfer goes unannounced, even across a crash.
 - **Observable.** Prometheus metrics, a Grafana dashboard, alert rules and k6 load tests come with recorded results.
 
-[DESIGN.md](DESIGN.md) covers how each guarantee is enforced and what happens when parts fail. [docs/results.md](docs/results.md) has the load-test measurements.
+[DESIGN.md](DESIGN.md) covers how each guarantee is enforced and what happens when parts fail. [docs/results.md](docs/results.md) has the load-test measurements. [docs/hot-accounts.md](docs/hot-accounts.md) is a write-up of the hot-account problem and fix: one merchant's row lock slowed unrelated transfers 40x, and deferring only the cached balance brought merchant p99 from 1.67 s to 31 ms.
 
 ![Test console: two concurrent requests with one idempotency key. One posts, the other is replayed with the same transfer id.](docs/images/console.png)
 
