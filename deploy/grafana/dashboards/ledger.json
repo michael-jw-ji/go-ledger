@@ -444,7 +444,7 @@
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Row-lock wait (SELECT \u2026 FOR UPDATE)",
+      "title": "Row-lock wait (SELECT \u2026 FOR NO KEY UPDATE)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

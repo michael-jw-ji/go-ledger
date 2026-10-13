@@ -60,7 +60,7 @@ func New(pool *pgxpool.Pool) *Metrics {
 		}, []string{"status"}),
 		lockWait: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "ledger_lock_wait_seconds",
-			Help:    "Time spent acquiring a transfer's account row locks (SELECT ... FOR UPDATE).",
+			Help:    "Time spent acquiring a transfer's account row locks (SELECT ... FOR NO KEY UPDATE).",
 			Buckets: latencyBuckets,
 		}),
 		idemLookups: prometheus.NewCounterVec(prometheus.CounterOpts{
