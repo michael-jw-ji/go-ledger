@@ -1,4 +1,6 @@
 .env
+.env.local
+.neon
 *.exe
 /bin/
 coverage.out
