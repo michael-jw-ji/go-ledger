@@ -56,11 +56,15 @@ curl -X POST localhost:8088/transfers -H 'Idempotency-Key: fund-alice-1' \
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/michael-jw-ji/go-ledger)
 
-The `Dockerfile` builds one image with the API and the web console: the console is served at `/` and the API under `/api`. [`render.yaml`](render.yaml) is a Render Blueprint that creates that web service, a Postgres database and a Redis-compatible Key Value store, all on free plans. Migrations run at startup, so there's nothing else to set up.
+The `Dockerfile` builds one image with the API and the web console: the console is served at `/` and the API under `/api`. [`render.yaml`](render.yaml) is a Render Blueprint that creates that web service and a Redis-compatible Key Value store, both on free plans. Postgres comes from [Neon](https://neon.com)'s free plan, which doesn't expire; Render's free Postgres is deleted after 30 days.
+
+1. Create a Neon project and copy its connection string with connection pooling turned **off** (the host must not contain `-pooler`). The API keeps its own connection pool, and the direct endpoint avoids any surprises with prepared statements.
+2. Click the button above, or in Render choose New > Blueprint and pick this repo.
+3. Paste the Neon string as `DATABASE_URL` when Render asks. Migrations run at startup, so there's nothing else to set up.
 
 Things to know about the free plans:
-- **Sleep.** The web service sleeps after a period without traffic, and the first request after that takes up to a minute while it wakes. The console says so while it waits.
-- **Database expiry.** Render's free Postgres has had an expiry date. Check the current terms, or point `DATABASE_URL` at another free Postgres such as Neon.
+- **Sleep.** The web service sleeps after 15 minutes without traffic, and the first request after that takes up to a minute while it wakes. The console says so while it waits. Neon suspends its compute once the app stops querying and wakes in under a second.
+- **Redis is not persistent** on the free plan. A restart empties the idempotency cache (Postgres is the source of truth for keys, so retries stay safe) and the history of the `ledger.events` stream.
 - **Open access.** The demo has no authentication, so anyone with the URL can create accounts and transfers. That's fine for a demo of fake money, but don't reuse it for anything real.
 
 To run the same image locally: `docker build -t go-ledger . && docker run -p 8088:8088 -e DATABASE_URL=... -e REDIS_URL=... go-ledger`. The API also honors `PORT` when `ADDR` isn't set.
