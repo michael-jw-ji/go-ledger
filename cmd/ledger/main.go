@@ -1,6 +1,7 @@
 // Command ledger runs the ledger HTTP API.
 //
-//	ledger         serve the API (and run reconciliation in the background)
+//	ledger         serve the API, with the reconciliation and hot-account
+//	               rollup workers in the background
 //	ledger recon   reconcile once, print the result, exit 1 on mismatches
 package main
 
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
 	"github.com/michael-jw-ji/go-ledger/internal/metrics"
 	"github.com/michael-jw-ji/go-ledger/internal/recon"
+	"github.com/michael-jw-ji/go-ledger/internal/rollup"
 	"github.com/michael-jw-ji/go-ledger/migrations"
 )
 
@@ -107,6 +110,10 @@ func serve(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("RECON_INTERVAL: %w", err)
 	}
+	rollupInterval, err := time.ParseDuration(env("ROLLUP_INTERVAL", "100ms"))
+	if err != nil {
+		return fmt.Errorf("ROLLUP_INTERVAL: %w", err)
+	}
 
 	redisOpts, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
 	if err != nil {
@@ -128,12 +135,11 @@ func serve(log *slog.Logger) error {
 	mux.Handle("GET /metrics", m.Handler())
 	mux.HandleFunc("GET /reconciliation", latestRecon(pool, log))
 
-	worker := &recon.Worker{Pool: pool, Interval: reconInterval, Log: log, OnResult: m.OnRecon}
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		worker.Run(ctx)
-	}()
+	var workers sync.WaitGroup
+	reconWorker := &recon.Worker{Pool: pool, Interval: reconInterval, Log: log, OnResult: m.OnRecon}
+	rollupWorker := &rollup.Worker{Pool: pool, Interval: rollupInterval, Log: log, OnTick: m.OnRollup}
+	workers.Go(func() { reconWorker.Run(ctx) })
+	workers.Go(func() { rollupWorker.Run(ctx) })
 
 	srv := &http.Server{
 		Addr:              env("ADDR", ":8088"),
@@ -144,7 +150,8 @@ func serve(log *slog.Logger) error {
 	}
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", srv.Addr, "recon_interval", reconInterval.String())
+		log.Info("listening", "addr", srv.Addr,
+			"recon_interval", reconInterval.String(), "rollup_interval", rollupInterval.String())
 		errc <- srv.ListenAndServe()
 	}()
 
@@ -159,7 +166,7 @@ func serve(log *slog.Logger) error {
 	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
-	<-workerDone
+	workers.Wait()
 	return nil
 }
 

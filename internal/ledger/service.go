@@ -43,12 +43,23 @@ func (s *Service) WithHooks(h Hooks) *Service {
 	return &Service{pool: s.pool, hooks: h}
 }
 
-const accountCols = `id, name, currency, normal_balance, allow_negative, balance, lock_version, created_at`
+// selectAccounts reads effective balances: the cached balance plus any hot
+// entries not rolled up yet, in one statement so both come from the same
+// snapshot.
+const selectAccounts = `
+	SELECT a.id, a.name, a.currency, a.normal_balance, a.allow_negative, a.hot,
+	       a.balance + COALESCE(p.total, 0), a.lock_version + COALESCE(p.n, 0), COALESCE(p.n, 0),
+	       a.created_at
+	FROM accounts a
+	LEFT JOIN LATERAL (
+	    SELECT SUM(signed_amount) AS total, COUNT(*) AS n
+	    FROM hot_pending WHERE account_id = a.id
+	) p ON a.hot`
 
 func scanAccount(row pgx.Row) (Account, error) {
 	var a Account
-	err := row.Scan(&a.ID, &a.Name, &a.Currency, &a.NormalBalance, &a.AllowNegative,
-		&a.Balance, &a.LockVersion, &a.CreatedAt)
+	err := row.Scan(&a.ID, &a.Name, &a.Currency, &a.NormalBalance, &a.AllowNegative, &a.Hot,
+		&a.Balance, &a.LockVersion, &a.PendingEntries, &a.CreatedAt)
 	return a, err
 }
 
@@ -57,15 +68,15 @@ func (s *Service) CreateAccount(ctx context.Context, in NewAccount) (Account, er
 		return Account{}, err
 	}
 	return scanAccount(s.pool.QueryRow(ctx, `
-		INSERT INTO accounts (name, currency, normal_balance, allow_negative)
-		VALUES ($1, $2, $3, $4)
-		RETURNING `+accountCols,
-		in.Name, in.Currency, string(in.NormalBalance), in.AllowNegative))
+		INSERT INTO accounts (name, currency, normal_balance, allow_negative, hot)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, name, currency, normal_balance, allow_negative, hot,
+		          balance, lock_version, 0::bigint, created_at`,
+		in.Name, in.Currency, string(in.NormalBalance), in.AllowNegative, in.Hot))
 }
 
 func (s *Service) GetAccount(ctx context.Context, id int64) (Account, error) {
-	a, err := scanAccount(s.pool.QueryRow(ctx,
-		`SELECT `+accountCols+` FROM accounts WHERE id = $1`, id))
+	a, err := scanAccount(s.pool.QueryRow(ctx, selectAccounts+` WHERE a.id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Account{}, fmt.Errorf("account %d: %w", id, ErrNotFound)
 	}
@@ -73,7 +84,7 @@ func (s *Service) GetAccount(ctx context.Context, id int64) (Account, error) {
 }
 
 func (s *Service) ListAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+accountCols+` FROM accounts ORDER BY id LIMIT 1000`)
+	rows, err := s.pool.Query(ctx, selectAccounts+` ORDER BY a.id LIMIT 1000`)
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +217,20 @@ func (s *Service) postTx(ctx context.Context, key string, hash []byte, legs []Le
 	return t, nil
 }
 
+// applyLegs checks the business rules and writes the entries. Accounts take
+// one of two paths:
+//
+//   - Locked: ordinary accounts, and hot accounts this transfer would
+//     decrease without an overdraft allowance. Their rows are locked in
+//     ascending id order (so transfers can't deadlock), checked, and updated.
+//   - Hot fast path: hot accounts this transfer increases (or that may go
+//     negative). No row lock and no balance update; each of their entries
+//     gets a hot_pending row instead, committed with the transfer, and the
+//     rollup worker applies it to the cached balance shortly after.
+//
+// The fast path can't break an overdraft check: unlocked writers only ever
+// add to a no-overdraft hot account, so a check made under its lock stays
+// true as their entries land.
 func (s *Service) applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID, legs []Leg) ([]Entry, ErrorCode, error) {
 	ids := make([]int64, 0, len(legs))
 	for _, l := range legs {
@@ -214,27 +239,29 @@ func (s *Service) applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID
 	slices.Sort(ids)
 	ids = slices.Compact(ids)
 
-	type locked struct {
+	type acct struct {
 		currency      string
 		normal        Side
 		allowNegative bool
-		balance       int64
-		delta, n      int64
+		hot           bool
+		locked        bool
+		cached        int64 // accounts.balance, read under the lock
+		folded, nFold int64 // pending hot entries rolled up by this transfer
+		delta, n      int64 // this transfer's effect
 	}
-	lockStart := time.Now()
+	// Currency, normal side and the flags never change after creation, so
+	// they can be read before deciding what to lock.
 	rows, err := tx.Query(ctx, `
-		SELECT id, currency, normal_balance, allow_negative, balance
-		FROM accounts WHERE id = ANY($1)
-		ORDER BY id
-		FOR UPDATE`, ids)
+		SELECT id, currency, normal_balance, allow_negative, hot
+		FROM accounts WHERE id = ANY($1)`, ids)
 	if err != nil {
 		return nil, "", err
 	}
-	accts := make(map[int64]*locked, len(ids))
+	accts := make(map[int64]*acct, len(ids))
 	for rows.Next() {
 		var id int64
-		a := &locked{}
-		if err := rows.Scan(&id, &a.currency, &a.normal, &a.allowNegative, &a.balance); err != nil {
+		a := &acct{}
+		if err := rows.Scan(&id, &a.currency, &a.normal, &a.allowNegative, &a.hot); err != nil {
 			rows.Close()
 			return nil, "", err
 		}
@@ -242,9 +269,6 @@ func (s *Service) applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID
 	}
 	if err := rows.Err(); err != nil {
 		return nil, "", err
-	}
-	if s.hooks.OnLockWait != nil {
-		s.hooks.OnLockWait(time.Since(lockStart))
 	}
 	if len(accts) != len(ids) {
 		return nil, CodeAccountNotFound, nil
@@ -264,14 +288,83 @@ func (s *Service) applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID
 		a.delta += l.delta(a.normal)
 		a.n++
 	}
-	deltas := make([]int64, len(ids))
-	counts := make([]int64, len(ids))
-	for i, id := range ids {
+	var lockIDs, hotLockIDs []int64
+	for _, id := range ids {
 		a := accts[id]
-		if !a.allowNegative && a.balance+a.delta < 0 {
+		a.locked = !a.hot || (a.delta < 0 && !a.allowNegative)
+		if a.locked {
+			lockIDs = append(lockIDs, id)
+			if a.hot {
+				hotLockIDs = append(hotLockIDs, id)
+			}
+		}
+	}
+
+	if len(lockIDs) > 0 {
+		// FOR NO KEY UPDATE, not FOR UPDATE: it still serializes balance
+		// writers, but doesn't conflict with the FOR KEY SHARE lock that
+		// inserting an entry (a foreign key to accounts) takes. With FOR
+		// UPDATE, a debit or rollup of a hot account would queue behind
+		// every in-flight credit to it, and new credits behind that.
+		lockStart := time.Now()
+		rows, err = tx.Query(ctx, `
+			SELECT id, balance FROM accounts WHERE id = ANY($1)
+			ORDER BY id
+			FOR NO KEY UPDATE`, lockIDs)
+		if err != nil {
+			return nil, "", err
+		}
+		for rows.Next() {
+			var id, bal int64
+			if err := rows.Scan(&id, &bal); err != nil {
+				rows.Close()
+				return nil, "", err
+			}
+			accts[id].cached = bal
+		}
+		if err := rows.Err(); err != nil {
+			return nil, "", err
+		}
+		if s.hooks.OnLockWait != nil {
+			s.hooks.OnLockWait(time.Since(lockStart))
+		}
+	}
+
+	// A hot account on the locked path is being debited, and its pending
+	// entries count toward what it can spend. Holding its row lock, roll
+	// them up here: that is the lock the rollup worker would take anyway,
+	// and it keeps the cached balance from dipping below zero.
+	if len(hotLockIDs) > 0 {
+		rows, err = tx.Query(ctx, `
+			WITH d AS (
+			    DELETE FROM hot_pending WHERE account_id = ANY($1)
+			    RETURNING account_id, signed_amount
+			)
+			SELECT account_id, SUM(signed_amount)::bigint, COUNT(*) FROM d GROUP BY account_id`, hotLockIDs)
+		if err != nil {
+			return nil, "", err
+		}
+		for rows.Next() {
+			var id, total, n int64
+			if err := rows.Scan(&id, &total, &n); err != nil {
+				rows.Close()
+				return nil, "", err
+			}
+			accts[id].folded, accts[id].nFold = total, n
+		}
+		if err := rows.Err(); err != nil {
+			return nil, "", err
+		}
+	}
+
+	deltas := make([]int64, len(lockIDs))
+	counts := make([]int64, len(lockIDs))
+	for i, id := range lockIDs {
+		a := accts[id]
+		if !a.allowNegative && a.cached+a.folded+a.delta < 0 {
 			return nil, CodeInsufficientFunds, nil
 		}
-		deltas[i], counts[i] = a.delta, a.n
+		deltas[i], counts[i] = a.folded+a.delta, a.nFold+a.n
 	}
 
 	accountIDs := make([]int64, len(legs))
@@ -297,13 +390,32 @@ func (s *Service) applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID
 	}
 	slices.SortFunc(entries, func(a, b Entry) int { return cmp.Compare(a.ID, b.ID) })
 
-	if _, err := tx.Exec(ctx, `
-		UPDATE accounts a
-		SET balance = a.balance + d.delta, lock_version = a.lock_version + d.n
-		FROM unnest($1::bigint[], $2::bigint[], $3::bigint[]) AS d(id, delta, n)
-		WHERE a.id = d.id`,
-		ids, deltas, counts); err != nil {
-		return nil, "", err
+	var pendingEntries, pendingAccounts, pendingAmounts []int64
+	for _, e := range entries {
+		if a := accts[e.AccountID]; !a.locked {
+			pendingEntries = append(pendingEntries, e.ID)
+			pendingAccounts = append(pendingAccounts, e.AccountID)
+			pendingAmounts = append(pendingAmounts, Leg{Direction: e.Direction, Amount: e.Amount}.delta(a.normal))
+		}
+	}
+	if len(pendingEntries) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO hot_pending (entry_id, account_id, signed_amount)
+			SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[])`,
+			pendingEntries, pendingAccounts, pendingAmounts); err != nil {
+			return nil, "", err
+		}
+	}
+
+	if len(lockIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE accounts a
+			SET balance = a.balance + d.delta, lock_version = a.lock_version + d.n
+			FROM unnest($1::bigint[], $2::bigint[], $3::bigint[]) AS d(id, delta, n)
+			WHERE a.id = d.id`,
+			lockIDs, deltas, counts); err != nil {
+			return nil, "", err
+		}
 	}
 	return entries, "", nil
 }

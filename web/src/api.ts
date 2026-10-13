@@ -8,8 +8,13 @@ export interface Account {
   currency: string
   normal_balance: Side
   allow_negative: boolean
+  /** Credits skip the row lock; the rollup worker applies them. */
+  hot: boolean
+  /** Effective balance: includes hot entries not rolled up yet. */
   balance: number
   lock_version: number
+  /** Hot entries committed but not yet in the cached balance. */
+  pending_entries: number
   created_at: string
 }
 
@@ -18,6 +23,7 @@ export interface NewAccount {
   currency: string
   normal_balance: Side
   allow_negative: boolean
+  hot?: boolean
 }
 
 export interface Leg {

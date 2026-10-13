@@ -4,11 +4,11 @@ import { formatMoney } from '../money'
 import { useInvalidateLedger } from '../queries'
 import { ErrorMessage } from './ErrorMessage'
 
-const DEMO: { name: string; allow_negative: boolean; fund?: number }[] = [
+const DEMO: { name: string; allow_negative: boolean; hot?: boolean; fund?: number }[] = [
   { name: 'Funding', allow_negative: true },
   { name: 'Alice', allow_negative: false, fund: 100_000 },
   { name: 'Bob', allow_negative: false, fund: 50_000 },
-  { name: 'Merchant', allow_negative: false },
+  { name: 'Merchant', allow_negative: false, hot: true },
 ]
 
 export function AccountsPanel({
@@ -25,6 +25,7 @@ export function AccountsPanel({
   const [currency, setCurrency] = useState('USD')
   const [normal, setNormal] = useState<Side>('credit')
   const [allowNegative, setAllowNegative] = useState(false)
+  const [hot, setHot] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<ApiError | null>(null)
 
@@ -33,9 +34,10 @@ export function AccountsPanel({
     setBusy(true)
     setError(null)
     try {
-      await api.createAccount({ name: name.trim(), currency: currency.trim().toUpperCase(), normal_balance: normal, allow_negative: allowNegative })
+      await api.createAccount({ name: name.trim(), currency: currency.trim().toUpperCase(), normal_balance: normal, allow_negative: allowNegative, hot })
       setName('')
       setAllowNegative(false)
+      setHot(false)
     } catch (err) {
       setError(err as ApiError)
     } finally {
@@ -50,7 +52,7 @@ export function AccountsPanel({
     try {
       const created: Account[] = []
       for (const d of DEMO) {
-        created.push((await api.createAccount({ name: d.name, currency: 'USD', normal_balance: 'credit', allow_negative: d.allow_negative })).data)
+        created.push((await api.createAccount({ name: d.name, currency: 'USD', normal_balance: 'credit', allow_negative: d.allow_negative, hot: d.hot })).data)
       }
       const funding = created[0]
       for (const [i, d] of DEMO.entries()) {
@@ -81,7 +83,7 @@ export function AccountsPanel({
         </div>
         {accounts.length === 0 ? (
           <div className="empty">
-            <p>No accounts yet. Seed a demo set: a funding account that may go negative, Alice ($1,000), Bob ($500) and a merchant.</p>
+            <p>No accounts yet. Seed a demo set: a funding account that may go negative, Alice ($1,000), Bob ($500) and a hot merchant account.</p>
             <button type="button" className="btn" onClick={seed} disabled={busy}>
               {busy ? 'Seeding…' : 'Seed demo accounts'}
             </button>
@@ -96,7 +98,7 @@ export function AccountsPanel({
                   <th>Normal</th>
                   <th>Rules</th>
                   <th className="num">Balance</th>
-                  <th className="num" title="Entries applied to the cached balance">Ver</th>
+                  <th className="num" title="Entries in the balance (lock_version); + entries waiting for the rollup">Ver</th>
                 </tr>
               </thead>
               <tbody>
@@ -112,10 +114,24 @@ export function AccountsPanel({
                     <td>{a.name}</td>
                     <td className="mono">{a.normal_balance}</td>
                     <td>
-                      {a.allow_negative ? <span className="badge muted">may go negative</span> : <span className="badge">no overdraft</span>}
+                      <span className="badges">
+                        {a.allow_negative ? <span className="badge muted">may go negative</span> : <span className="badge">no overdraft</span>}
+                        {a.hot && (
+                          <span className="badge orange" title="Credits skip the row lock and are rolled up every ~100ms">
+                            hot
+                          </span>
+                        )}
+                      </span>
                     </td>
                     <td className={`num${a.balance < 0 ? ' neg' : ''}`}>{formatMoney(a.balance, a.currency)}</td>
-                    <td className="num dim">{a.lock_version}</td>
+                    <td className="num dim">
+                      {a.lock_version}
+                      {a.pending_entries > 0 && (
+                        <span className="orange" title={`${a.pending_entries} entries waiting for the rollup worker`}>
+                          {' '}+{a.pending_entries}
+                        </span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -152,6 +168,10 @@ export function AccountsPanel({
             <input type="checkbox" checked={allowNegative} onChange={(e) => setAllowNegative(e.target.checked)} />
             Allow negative balance
           </label>
+          <label className="check">
+            <input type="checkbox" checked={hot} onChange={(e) => setHot(e.target.checked)} />
+            Hot account (many concurrent credits)
+          </label>
           <div className="btn-row" style={{ marginTop: 8 }}>
             <button className="btn" type="submit" disabled={busy || !name.trim()}>
               Create account
@@ -162,6 +182,10 @@ export function AccountsPanel({
         <div className="callout neutral">
           <strong>Normal balance</strong> decides which direction makes the balance go up. A credit-normal wallet grows when
           it is credited. A debit-normal cash account grows when it is debited.
+        </div>
+        <div className="callout neutral">
+          <strong>Hot accounts</strong> take credits without locking their row. Each entry commits with its transfer, and a
+          background job folds them into the cached balance about every 100ms. Balances shown here already include them.
         </div>
       </aside>
     </div>

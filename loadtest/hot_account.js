@@ -2,7 +2,11 @@
 // money between random users. Every merchant credit takes the merchant's row
 // lock, so these transfers serialize; watch ledger_lock_wait_seconds.
 //
-//   RATE (transfers/s, default 300)  DURATION (default 60s)
+// The merchant is created hot, so credits skip its row lock and the rollup
+// worker applies them. HOT=false creates an ordinary merchant instead, to
+// reproduce the milestone 3 baseline.
+//
+//   RATE (transfers/s, default 300)  DURATION (default 60s)  HOT (default true)
 import { setupAccounts, transfer, pick } from './lib.js';
 
 const RATE = Number(__ENV.RATE || 300);
@@ -29,7 +33,8 @@ export const options = {
 };
 
 export function setup() {
-  const { users, extras } = setupAccounts(1000, 1_000_000, ['merchant']);
+  const hot = (__ENV.HOT || 'true') !== 'false';
+  const { users, extras } = setupAccounts(1000, 1_000_000, [{ name: 'merchant', hot }]);
   return { users, merchant: extras[0] };
 }
 

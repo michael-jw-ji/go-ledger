@@ -24,10 +24,12 @@ const (
 	KindTransfer = "transfer"
 	// KindTrialBalance: total debits and credits differ within a currency.
 	KindTrialBalance = "trial_balance"
+	// KindPending: a hot_pending row disagrees with the entry it stands for.
+	KindPending = "pending"
 )
 
 // Kinds lists every kind, so metrics can report zeros for the clean ones.
-var Kinds = []string{KindAccount, KindTransfer, KindTrialBalance}
+var Kinds = []string{KindAccount, KindTransfer, KindTrialBalance, KindPending}
 
 // Mismatch is one finding. Only the fields relevant to its kind are set.
 type Mismatch struct {
@@ -129,16 +131,21 @@ func check(ctx context.Context, tx pgx.Tx, res *Result) error {
 	if err := checkTrialBalance(ctx, tx, res); err != nil {
 		return fmt.Errorf("check trial balance: %w", err)
 	}
+	if err := checkPending(ctx, tx, res); err != nil {
+		return fmt.Errorf("check pending: %w", err)
+	}
 	return nil
 }
 
 // signed is an entry's effect on its account's balance, which grows on the
-// account's normal side.
+// account's normal side. Cached balances are compared as effective balances:
+// accounts.balance plus the account's hot_pending rows.
 const signed = `CASE WHEN e.direction = a.normal_balance THEN e.amount ELSE -e.amount END`
 
 func checkAccounts(ctx context.Context, tx pgx.Tx, res *Result) error {
 	rows, err := tx.Query(ctx, `
-		SELECT a.id, a.balance, a.lock_version,
+		SELECT a.id,
+		       a.balance + COALESCE(p.total, 0), a.lock_version + COALESCE(p.n, 0),
 		       COALESCE(s.total, 0), COALESCE(s.n, 0)
 		FROM accounts a
 		LEFT JOIN (
@@ -146,6 +153,10 @@ func checkAccounts(ctx context.Context, tx pgx.Tx, res *Result) error {
 		    FROM entries e JOIN accounts a ON a.id = e.account_id
 		    GROUP BY e.account_id
 		) s ON s.account_id = a.id
+		LEFT JOIN (
+		    SELECT account_id, SUM(signed_amount) AS total, COUNT(*) AS n
+		    FROM hot_pending GROUP BY account_id
+		) p ON p.account_id = a.id
 		ORDER BY a.id`)
 	if err != nil {
 		return err
@@ -211,6 +222,30 @@ func checkTrialBalance(ctx context.Context, tx pgx.Tx, res *Result) error {
 			m.Kind = KindTrialBalance
 			res.Mismatches = append(res.Mismatches, m)
 		}
+	}
+	return rows.Err()
+}
+
+// checkPending catches a pending row filed under the wrong account or with
+// the wrong sign or amount: the account check alone would see such a row as
+// two accounts drifting in opposite directions.
+func checkPending(ctx context.Context, tx pgx.Tx, res *Result) error {
+	rows, err := tx.Query(ctx, `
+		SELECT p.account_id, p.signed_amount, `+signed+`
+		FROM hot_pending p
+		JOIN entries e ON e.id = p.entry_id
+		JOIN accounts a ON a.id = e.account_id
+		WHERE p.account_id <> e.account_id OR p.signed_amount <> `+signed)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		m := Mismatch{Kind: KindPending}
+		if err := rows.Scan(&m.AccountID, &m.Cached, &m.Computed); err != nil {
+			return err
+		}
+		res.Mismatches = append(res.Mismatches, m)
 	}
 	return rows.Err()
 }

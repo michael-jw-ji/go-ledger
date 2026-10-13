@@ -17,3 +17,13 @@ groups:
           severity: ticket
         annotations:
           summary: "No successful reconciliation for 5 minutes"
+
+      # Reads stay correct while pending rows pile up, but a growing backlog
+      # means the rollup worker is down or can't keep up.
+      - alert: LedgerRollupBacklog
+        expr: ledger_hot_pending_entries > 10000
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} hot-account entries waiting for the rollup worker"

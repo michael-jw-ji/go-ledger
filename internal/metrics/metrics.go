@@ -3,6 +3,7 @@
 package metrics
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -35,6 +36,9 @@ type Metrics struct {
 	reconDuration     prometheus.Histogram
 	reconFailures     prometheus.Counter
 	reconAccountsSeen prometheus.Gauge
+	rollupDuration    prometheus.Histogram
+	rollupEntries     prometheus.Counter
+	rollupFailures    prometheus.Counter
 }
 
 func New(pool *pgxpool.Pool) *Metrics {
@@ -85,6 +89,20 @@ func New(pool *pgxpool.Pool) *Metrics {
 			Help: "Accounts checked by the last reconciliation run.",
 		}),
 	}
+	m.rollupDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ledger_rollup_duration_seconds",
+		Help:    "Duration of one hot-account rollup tick.",
+		Buckets: latencyBuckets,
+	})
+	m.rollupEntries = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "ledger_rollup_entries_total",
+		Help: "Pending hot-account entries folded into cached balances by the rollup worker.",
+	})
+	m.rollupFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "ledger_rollup_failures_total",
+		Help: "Rollup ticks that errored.",
+	})
+	m.reg.MustRegister(m.rollupDuration, m.rollupEntries, m.rollupFailures)
 	m.reg.MustRegister(
 		m.httpDuration, m.transfers, m.txDuration, m.lockWait, m.idemLookups,
 		m.reconMismatches, m.reconLastSuccess, m.reconDuration, m.reconFailures, m.reconAccountsSeen,
@@ -93,6 +111,20 @@ func New(pool *pgxpool.Pool) *Metrics {
 	)
 	if pool != nil {
 		m.reg.MustRegister(newPoolCollector(pool))
+		// Counted at scrape time; the table holds at most ~one rollup
+		// interval of hot entries, so this stays cheap.
+		m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "ledger_hot_pending_entries",
+			Help: "Hot-account entries committed but not yet in the cached balance.",
+		}, func() float64 {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var n int64
+			if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM hot_pending`).Scan(&n); err != nil {
+				return -1
+			}
+			return float64(n)
+		}))
 	}
 	// Pre-create the series so dashboards show 0 instead of "no data".
 	for _, s := range []string{"posted", "rejected", "replayed", "conflict", "error"} {
@@ -141,6 +173,16 @@ func (m *Metrics) OnRecon(res recon.Result, took time.Duration, err error) {
 	m.reconAccountsSeen.Set(float64(res.AccountsChecked))
 	m.reconDuration.Observe(took.Seconds())
 	m.reconLastSuccess.Set(float64(res.FinishedAt.Unix()))
+}
+
+// OnRollup is a rollup.Worker.OnTick hook.
+func (m *Metrics) OnRollup(applied int64, took time.Duration, err error) {
+	if err != nil {
+		m.rollupFailures.Inc()
+		return
+	}
+	m.rollupEntries.Add(float64(applied))
+	m.rollupDuration.Observe(took.Seconds())
 }
 
 // Router is the subset of *http.ServeMux used to resolve a request's route.

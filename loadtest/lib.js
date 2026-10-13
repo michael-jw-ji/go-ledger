@@ -28,7 +28,8 @@ function createAccounts(specs) {
 }
 
 // Creates a funding account (allowed to go negative) and n user accounts,
-// each funded with `fund` cents, plus any extra named accounts.
+// each funded with `fund` cents, plus extra accounts given as
+// { name, hot } specs.
 export function setupAccounts(n, fund, extra = []) {
   const run = Date.now();
   const [funding] = createAccounts([
@@ -38,7 +39,7 @@ export function setupAccounts(n, fund, extra = []) {
     Array.from({ length: n }, (_, i) => ({ name: `k6 user ${run}-${i}`, currency: 'USD', normal_balance: 'credit' })),
   );
   const extras = createAccounts(
-    extra.map((name) => ({ name: `k6 ${name} ${run}`, currency: 'USD', normal_balance: 'credit' })),
+    extra.map((e) => ({ name: `k6 ${e.name} ${run}`, currency: 'USD', normal_balance: 'credit', hot: !!e.hot })),
   );
   for (let i = 0; i < users.length; i += 100) {
     const reqs = users.slice(i, i + 100).map((id) => [

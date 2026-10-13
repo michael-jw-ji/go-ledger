@@ -17,8 +17,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
+	"github.com/michael-jw-ji/go-ledger/internal/recon"
+	"github.com/michael-jw-ji/go-ledger/internal/rollup"
 )
+
+// sampleRecon reconciles one REPEATABLE READ snapshot without recording a
+// run.
+func sampleRecon(ctx context.Context) error {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // read-only
+	res, err := recon.Check(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if len(res.Mismatches) > 0 {
+		return fmt.Errorf("mid-run reconciliation found %d mismatches: %+v", len(res.Mismatches), res.Mismatches)
+	}
+	return nil
+}
 
 // The property tests hammer the HTTP API with random multi-leg transfers from
 // many goroutines, retrying a share of requests with the same key (some
@@ -42,6 +64,8 @@ const (
 	propStartFunds  = 10_000
 	propMaxTransfer = 4_000
 	propRetryShare  = 0.20
+	propHotAccounts = 2
+	propHotPayShare = 0.40
 )
 
 type propOp struct {
@@ -77,7 +101,9 @@ func runProperty(t *testing.T, flushRedis bool) {
 	}
 
 	// Half the accounts are debit-normal, so both balance conventions are
-	// exercised. None may go negative; funding may.
+	// exercised. The first two are hot, so increases to them take the
+	// unlocked path and decreases the locked one. None may go negative;
+	// funding may.
 	funding := newAccount(t, true)
 	accts := make([]ledger.Account, propAccounts)
 	ids := make([]int64, 0, propAccounts+1)
@@ -86,7 +112,9 @@ func runProperty(t *testing.T, flushRedis bool) {
 		if i%2 == 1 {
 			normal = ledger.Debit
 		}
-		a, err := svc.CreateAccount(ctx, ledger.NewAccount{Name: uniq("prop"), Currency: "USD", NormalBalance: normal})
+		a, err := svc.CreateAccount(ctx, ledger.NewAccount{
+			Name: uniq("prop"), Currency: "USD", NormalBalance: normal, Hot: i < propHotAccounts,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -130,6 +158,38 @@ func runProperty(t *testing.T, flushRedis bool) {
 			}
 		}()
 	}
+
+	// The rollup worker runs throughout, faster than in production so it
+	// races the transfers more often. A sampler reconciles a fresh snapshot
+	// over and over: effective balances must match the entries at every
+	// instant, not just once the run has drained.
+	bgCtx, stopBG := context.WithCancel(ctx)
+	var bgWG sync.WaitGroup
+	var rolledUp, samples atomic.Int64
+	roll := &rollup.Worker{Pool: pool, Interval: 20 * time.Millisecond, Log: quietLog(),
+		OnTick: func(n int64, _ time.Duration, err error) {
+			if err != nil && bgCtx.Err() == nil {
+				t.Errorf("rollup: %v", err)
+			}
+			rolledUp.Add(n)
+		}}
+	bgWG.Go(func() { roll.Run(bgCtx) })
+	bgWG.Go(func() {
+		tick := time.NewTicker(25 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-bgCtx.Done():
+				return
+			case <-tick.C:
+			}
+			if err := sampleRecon(bgCtx); err != nil && bgCtx.Err() == nil {
+				t.Error(err)
+				return
+			}
+			samples.Add(1)
+		}
+	})
 
 	var stats propStats
 	results := make([][]outcome, len(ops))
@@ -182,6 +242,11 @@ func runProperty(t *testing.T, flushRedis bool) {
 	elapsed := time.Since(start)
 	close(stopFlush)
 	flushWG.Wait()
+	stopBG()
+	bgWG.Wait()
+	if samples.Load() == 0 {
+		t.Error("the mid-run reconciliation sampler never completed a sample")
+	}
 	if t.Failed() {
 		t.FailNow()
 	}
@@ -266,9 +331,46 @@ func runProperty(t *testing.T, flushRedis bool) {
 	// The production reconciliation job must agree.
 	assertReconClean(t)
 
+	// Draining the rest changes cached balances but no effective ones.
+	n, err := rollup.Once(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rolledUp.Add(n)
+	var left int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM hot_pending`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Fatalf("%d pending entries left after a full rollup", left)
+	}
+	assertBalancesMatchEntries(t, ids)
+	if got := signedSum(t, accts); got != startSum {
+		t.Fatalf("signed balance sum drifted after rollup: %d -> %d", startSum, got)
+	}
+	assertReconClean(t)
+
 	t.Logf("%d transfers in %s: %d posted, %d rejected; %d requests, %d replayed, %d got 409; %d redis flushes",
 		len(ops), elapsed.Round(time.Millisecond), posted, rejected,
 		stats.requests.Load(), stats.replayed.Load(), stats.conflicts.Load(), flushes.Load())
+	// Entries that took the unlocked path: hot-account legs of transfers that
+	// didn't decrease that account.
+	var unlocked int64
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(n), 0) FROM (
+		    SELECT COUNT(*) AS n
+		    FROM entries e JOIN accounts a ON a.id = e.account_id
+		    WHERE a.id = ANY($1)
+		    GROUP BY e.transfer_id, e.account_id
+		    HAVING SUM(CASE WHEN e.direction = a.normal_balance THEN e.amount ELSE -e.amount END) >= 0
+		) x`, ids[:propHotAccounts]).Scan(&unlocked); err != nil {
+		t.Fatal(err)
+	}
+	if unlocked == 0 {
+		t.Error("no entries took the unlocked hot-account path")
+	}
+	t.Logf("%d hot entries skipped the row lock; the worker rolled up %d (debits folded the rest); %d mid-run reconciliation samples, all clean",
+		unlocked, rolledUp.Load(), samples.Load())
 	if posted == 0 || rejected == 0 {
 		t.Errorf("want both posted and rejected transfers, got %d and %d", posted, rejected)
 	}
@@ -276,6 +378,17 @@ func runProperty(t *testing.T, flushRedis bool) {
 
 // randomLegs builds a balanced 2-4 leg transfer over distinct accounts.
 func randomLegs(r *rand.Rand, accts []ledger.Account) []ledger.Leg {
+	// Payments into a hot account, so many unlocked writers race the
+	// rollup worker and the locked debits of the same account.
+	if r.Float64() < propHotPayShare {
+		hot := accts[r.IntN(propHotAccounts)]
+		payer := accts[propHotAccounts+r.IntN(len(accts)-propHotAccounts)]
+		amt := 1 + r.Int64N(propMaxTransfer/8)
+		return []ledger.Leg{
+			{AccountID: payer.ID, Direction: hot.NormalBalance.Opposite(), Amount: amt},
+			{AccountID: hot.ID, Direction: hot.NormalBalance, Amount: amt},
+		}
+	}
 	k := 2 + r.IntN(3)
 	debits := 1 + r.IntN(k-1)
 	total := max(int64(k), 1+r.Int64N(propMaxTransfer))
@@ -383,7 +496,9 @@ func signedSum(t *testing.T, accts []ledger.Account) int64 {
 func assertBalancesMatchEntries(t *testing.T, ids []int64) {
 	t.Helper()
 	rows, err := pool.Query(context.Background(), `
-		SELECT a.id, a.balance, a.lock_version,
+		SELECT a.id,
+		       a.balance + COALESCE((SELECT sum(signed_amount) FROM hot_pending p WHERE p.account_id = a.id), 0),
+		       a.lock_version + (SELECT count(*) FROM hot_pending p WHERE p.account_id = a.id),
 		       COALESCE(sum(CASE WHEN e.direction = a.normal_balance THEN e.amount ELSE -e.amount END), 0),
 		       count(e.id)
 		FROM accounts a LEFT JOIN entries e ON e.account_id = a.id
@@ -400,7 +515,7 @@ func assertBalancesMatchEntries(t *testing.T, ids []int64) {
 			t.Fatal(err)
 		}
 		if bal != fromEntries {
-			t.Errorf("account %d: cached balance %d, entries sum to %d", id, bal, fromEntries)
+			t.Errorf("account %d: effective balance %d, entries sum to %d", id, bal, fromEntries)
 		}
 		if version != count {
 			t.Errorf("account %d: lock_version %d, %d entries", id, version, count)

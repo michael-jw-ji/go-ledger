@@ -31,15 +31,21 @@ func (s Side) Opposite() Side {
 
 // Account is a ledger account. Balance is signed relative to NormalBalance:
 // a debit-normal account goes up on debits, a credit-normal one on credits.
+//
+// Balance and LockVersion are effective values. For a hot account they
+// include entries the rollup worker has not folded into the cached balance
+// yet (PendingEntries of them), so they always match the account's entries.
 type Account struct {
-	ID            int64     `json:"id"`
-	Name          string    `json:"name"`
-	Currency      string    `json:"currency"`
-	NormalBalance Side      `json:"normal_balance"`
-	AllowNegative bool      `json:"allow_negative"`
-	Balance       int64     `json:"balance"`
-	LockVersion   int64     `json:"lock_version"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID             int64     `json:"id"`
+	Name           string    `json:"name"`
+	Currency       string    `json:"currency"`
+	NormalBalance  Side      `json:"normal_balance"`
+	AllowNegative  bool      `json:"allow_negative"`
+	Hot            bool      `json:"hot"`
+	Balance        int64     `json:"balance"`
+	LockVersion    int64     `json:"lock_version"`
+	PendingEntries int64     `json:"pending_entries"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // NewAccount is the input to CreateAccount.
@@ -48,6 +54,10 @@ type NewAccount struct {
 	Currency      string `json:"currency"`
 	NormalBalance Side   `json:"normal_balance"`
 	AllowNegative bool   `json:"allow_negative"`
+	// Hot marks an account that many transfers credit at once, such as a
+	// merchant or fee account. Increases to it skip its row lock; see
+	// hot_pending.
+	Hot bool `json:"hot"`
 }
 
 // Leg is one requested entry of a transfer.

@@ -45,9 +45,10 @@ web-test:
 	cd web && npm test
 
 # k6 load tests via Docker against the API from make run. Override RATE and
-# DURATION, e.g. make load-hot RATE=500 DURATION=2m.
+# DURATION, e.g. make load-hot RATE=500 DURATION=2m. HOT=false makes the
+# hot-account test's merchant an ordinary account (the pre-rollup baseline).
 K6 = docker run --rm -i --add-host=host.docker.internal:host-gateway \
-	-v "$(CURDIR)/loadtest:/scripts" -w /scripts -e RATE -e DURATION -e BASE_URL grafana/k6:1.2.0 run
+	-v "$(CURDIR)/loadtest:/scripts" -w /scripts -e RATE -e DURATION -e BASE_URL -e HOT grafana/k6:1.2.0 run
 
 load-steady:
 	$(K6) steady.js

@@ -6,8 +6,8 @@ import type { Account } from '../api'
 import { TransferForm } from './TransferForm'
 
 const accounts: Account[] = [
-  { id: 1, name: 'Funding', currency: 'USD', normal_balance: 'credit', allow_negative: true, balance: 0, lock_version: 0, created_at: '' },
-  { id: 2, name: 'Alice', currency: 'USD', normal_balance: 'credit', allow_negative: false, balance: 1000, lock_version: 0, created_at: '' },
+  { id: 1, name: 'Funding', currency: 'USD', normal_balance: 'credit', allow_negative: true, hot: false, balance: 0, lock_version: 0, pending_entries: 0, created_at: '' },
+  { id: 2, name: 'Alice', currency: 'USD', normal_balance: 'credit', allow_negative: false, hot: false, balance: 1000, lock_version: 0, pending_entries: 0, created_at: '' },
 ]
 
 const posted = {

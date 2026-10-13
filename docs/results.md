@@ -41,4 +41,33 @@ Reconciliation ran every 15 seconds through every run above and reported 0 misma
 
 ## After the hot-account rollup (milestone 5)
 
-Not measured yet.
+The merchant is created with `hot: true`. Credits to it insert their entry plus a `hot_pending` row and skip the account's row lock. The rollup worker folds pending rows into the cached balance every 100 ms. `HOT=false` creates an ordinary merchant on the same build, so both sides of each comparison ran back to back on identical code.
+
+### Hot account, before and after
+
+| Run | Achieved | Merchant p50 / p99 | User→user p50 / p99 | Lock wait p50 / p99 | Pool acquires that waited | Failed |
+|---|---|---|---|---|---|---|
+| 300/s, ordinary merchant (`HOT=false`) | 275/s (383 dropped) | 285 ms / 1.67 s | 246 ms / 1.39 s | 5.5 / 846 ms | 11,463 of 17,228 (67%) | 0% |
+| 300/s, hot merchant | 283/s (0 dropped) | 6.4 / 30.9 ms | 6.0 / 26.5 ms | 0.6 / 1.8 ms | 55 of 19,223 (0.3%) | 0% |
+| 1,000/s, hot merchant, 30s | 879/s (350 dropped) | 10.7 / 232 ms | 10.2 / 235 ms | 0.8 / 4.2 ms | 11,608 of 34,640 | 0% |
+
+At 300/s, merchant p99 drops from 1.67 s to 31 ms and lock-wait p99 from 846 ms to 1.8 ms. Unrelated user→user transfers recover too (1.39 s to 27 ms), because connections no longer sit queued on the merchant's lock.
+
+At 1,000/s the hot test saturates at 879/s, essentially the steady test's ceiling (below). The hot account is no longer the bottleneck; the connection pool is, as it is for the spread-out workload. Merchant and user→user latencies are the same, which says the remaining queueing has nothing to do with the merchant.
+
+Today's `HOT=false` rerun was slower than the milestone 3 baseline at the same rate (merchant p99 1.67 s vs 882 ms). Both are well past the knee, where small changes in lock hold time swing the queue a lot. The comparison that matters is the back-to-back pair above.
+
+### Steady load on the milestone 5 build
+
+The transfer path now reads account attributes before deciding which rows to lock: one extra round trip per transfer.
+
+| Target rate | Achieved | p50 | p95 | p99 | Failed |
+|---|---|---|---|---|---|
+| 300/s, 60s | 284/s | 6.7 ms | 13.0 ms | 51.7 ms | 0% |
+| 1,000/s, 30s | 896/s | 8.9 ms | 148 ms | 276 ms | 0% |
+
+p50 matches milestone 3 (6.6 ms). p99 at 300/s is 52 ms against 32 ms before, but tail latency on this shared laptop varies by that much between runs (at 1,000/s it came out lower than before). A cache of each account's immutable attributes would remove the extra query if it ever shows up in a profile.
+
+### Rollup worker
+
+Over all the runs above, the worker applied 42,962 pending entries in 2,922 ticks; idle ticks are cheap. `ledger_hot_pending_entries` read 0 after each run drained. Reconciliation ran every 15 seconds throughout and reported 0 mismatches every time, with effective balances (cached plus pending) compared against the entries.
