@@ -6,6 +6,7 @@ A double-entry payments ledger in Go and Postgres, built to show payments correc
 - **Exactly-once posting.** Idempotency keys are enforced in two layers. Redis handles replays and in-flight duplicates. A Postgres backstop keeps the guarantee when Redis is down or flushed, and it covers rejected attempts too.
 - **Concurrency without deadlocks.** Row locks are taken in id order. A rollup scheme removes the row-lock bottleneck on hot accounts (a merchant receiving most payments) without buffering money in memory.
 - **Continuous reconciliation.** A background job checks every balance against the append-only entries in one snapshot, and alerts on any mismatch.
+- **Reliable events.** A transactional outbox writes a `transfer.posted` event in the same transaction as the money movement. A worker publishes it to a Redis stream at least once, so no posted transfer goes unannounced, even across a crash.
 - **Observable.** Prometheus metrics, a Grafana dashboard, alert rules and k6 load tests come with recorded results.
 
 [DESIGN.md](DESIGN.md) covers how each guarantee is enforced and what happens when parts fail. [docs/results.md](docs/results.md) has the load-test measurements.
@@ -65,7 +66,9 @@ curl -X POST localhost:8088/transfers -H 'Idempotency-Key: fund-alice-1' \
 | `make load-steady` / `make load-hot` | k6 via Docker. Override with `RATE=500 DURATION=2m`; `HOT=false` gives the hot test an ordinary merchant. |
 | `make web` / `make web-test` | Test console dev server / Vitest suite |
 
-The API reads `DATABASE_URL`, `REDIS_URL`, `ADDR`, `RECON_INTERVAL` (default `60s`) and `ROLLUP_INTERVAL` (default `100ms`).
+The API reads `DATABASE_URL`, `REDIS_URL`, `ADDR`, `RECON_INTERVAL` (default `60s`), `ROLLUP_INTERVAL` (default `100ms`), `OUTBOX_INTERVAL` (default `200ms`) and `OUTBOX_STREAM` (default `ledger.events`).
+
+Events go to the Redis stream `ledger.events`, one message per posted transfer or reversal, with fields `event_id`, `type`, `aggregate_id`, `created_at` and `payload` (the transfer as JSON). Delivery is at least once, so dedupe on `event_id`. To watch it: `docker compose exec redis redis-cli XREAD BLOCK 0 STREAMS ledger.events $`.
 
 ## API
 
@@ -97,7 +100,7 @@ A rejected transfer is recorded, so retrying its key returns the same 422. A req
 
 ![Grafana dashboard during a hot-account load test](docs/images/grafana.png)
 
-`make obs` provisions the dashboard above. Its rows cover correctness (reconciliation), throughput, latency (including row-lock wait), idempotency and the connection pool, and the hot-account rollup. Prometheus alert rules fire on any reconciliation mismatch, on recon going stale, and on a rollup backlog.
+`make obs` provisions the dashboard above. Its rows cover correctness (reconciliation), throughput, latency (including row-lock wait), idempotency and the connection pool, the hot-account rollup, and the outbox. Prometheus alert rules fire on any reconciliation mismatch, on recon going stale, on a rollup backlog, and on outbox lag.
 
 ## Testing
 
@@ -114,6 +117,7 @@ internal/ledger/       domain types, validation, posting logic (Postgres transac
 internal/idempotency/  Redis key store and HTTP middleware
 internal/recon/        reconciliation checks and worker
 internal/rollup/       hot-account rollup worker
+internal/outbox/       transactional outbox publisher (Redis stream)
 internal/metrics/      Prometheus collectors and hook adapters
 internal/httpapi/      routes, JSON, error mapping
 migrations/            goose SQL migrations, embedded and run at startup

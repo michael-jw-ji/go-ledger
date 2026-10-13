@@ -39,6 +39,8 @@ type Metrics struct {
 	rollupDuration    prometheus.Histogram
 	rollupEntries     prometheus.Counter
 	rollupFailures    prometheus.Counter
+	outboxPublished   prometheus.Counter
+	outboxFailures    prometheus.Counter
 }
 
 func New(pool *pgxpool.Pool) *Metrics {
@@ -102,7 +104,15 @@ func New(pool *pgxpool.Pool) *Metrics {
 		Name: "ledger_rollup_failures_total",
 		Help: "Rollup ticks that errored.",
 	})
-	m.reg.MustRegister(m.rollupDuration, m.rollupEntries, m.rollupFailures)
+	m.outboxPublished = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "outbox_published_total",
+		Help: "Outbox events appended to the Redis stream (duplicates after a crash count again).",
+	})
+	m.outboxFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "outbox_publish_failures_total",
+		Help: "Outbox publish runs that failed and will be retried.",
+	})
+	m.reg.MustRegister(m.rollupDuration, m.rollupEntries, m.rollupFailures, m.outboxPublished, m.outboxFailures)
 	m.reg.MustRegister(
 		m.httpDuration, m.transfers, m.txDuration, m.lockWait, m.idemLookups,
 		m.reconMismatches, m.reconLastSuccess, m.reconDuration, m.reconFailures, m.reconAccountsSeen,
@@ -124,6 +134,23 @@ func New(pool *pgxpool.Pool) *Metrics {
 				return -1
 			}
 			return float64(n)
+		}))
+		// Age of the oldest event not yet published: how stale a consumer
+		// of the stream can be. 0 when the outbox is drained.
+		m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "outbox_lag_seconds",
+			Help: "Age of the oldest unpublished outbox event, 0 when none are waiting.",
+		}, func() float64 {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var lag float64
+			err := pool.QueryRow(ctx, `
+				SELECT COALESCE(EXTRACT(EPOCH FROM now() - MIN(created_at)), 0)::float8
+				FROM outbox WHERE published_at IS NULL`).Scan(&lag)
+			if err != nil {
+				return -1
+			}
+			return lag
 		}))
 	}
 	// Pre-create the series so dashboards show 0 instead of "no data".
@@ -183,6 +210,14 @@ func (m *Metrics) OnRollup(applied int64, took time.Duration, err error) {
 	}
 	m.rollupEntries.Add(float64(applied))
 	m.rollupDuration.Observe(took.Seconds())
+}
+
+// OnOutbox is an outbox.Worker.OnTick hook.
+func (m *Metrics) OnOutbox(published int, err error) {
+	m.outboxPublished.Add(float64(published))
+	if err != nil {
+		m.outboxFailures.Inc()
+	}
 }
 
 // Router is the subset of *http.ServeMux used to resolve a request's route.

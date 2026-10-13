@@ -19,6 +19,7 @@ This document covers how go-ledger keeps money correct. It explains the guarante
 | `entries` | The source of truth. Each row is one leg: `(transfer_id, account_id, direction, amount > 0)`. A trigger rejects `UPDATE` and `DELETE`. |
 | `hot_pending` | Entries of hot accounts not yet folded into the cached balance (see [Hot accounts](#hot-accounts)). |
 | `reconciliation_runs` | Audit trail of every reconciliation run and its findings. |
+| `outbox` | Events for posted transfers, written in the same transaction and published to a Redis stream (see [Events](#events-transactional-outbox)). |
 
 Money is an `int64` count of minor units. Floats appear nowhere: the API, the database and the web console's parser all use integers. Validation caps legs at 64 and each amount at 10^15, so no sum can overflow.
 
@@ -132,6 +133,34 @@ As a mutation check, the Postgres key was briefly made unique per attempt so the
 - **`hot` is fixed at creation.** Reads only add pending rows for accounts flagged hot. Making the flag mutable would need a rollup under the row lock before clearing it.
 
 **The result.** At 300 transfers/s with 90% paying one merchant, merchant p99 fell from 1.67 s to 31 ms, measured back to back on the same build. The hot test now saturates at the same rate as the spread-out workload; the connection pool, not the account row, is the limit.
+
+## Events: transactional outbox
+
+Other systems need to hear when money moves. Examples: a notification service, a search index, a data warehouse. The obvious approach publishes to a queue after the transaction commits. If the process dies between the commit and the publish, the money moved and nobody heard about it. Publishing before the commit has the opposite failure: an event goes out for a transfer that then rolls back.
+
+**The design.** A posted transfer writes its event, `transfer.posted` or `transfer.reversed` with the transfer as JSON, into an `outbox` table in the same statement that marks the transfer posted. The event exists if and only if the money moved. Rejections and replays write nothing.
+
+A worker (`internal/outbox`, every 200 ms, `OUTBOX_INTERVAL`) publishes the backlog in one transaction:
+1. It claims up to 100 unpublished rows with `FOR UPDATE SKIP LOCKED`.
+2. It appends each to the Redis stream `ledger.events` with `XADD`.
+3. It marks the rows published and commits.
+
+**At-least-once delivery.** If the process dies after `XADD` and before the commit, the rows are still unpublished, and the next run sends them again. Events are never lost, but a crash can duplicate a batch. Each stream message carries `event_id` (the outbox row id), so consumers dedupe on it. Exactly-once delivery to an external system isn't achievable without the consumer's cooperation. Being explicit about at-least-once is the honest version.
+
+**Several publishers** can run at once (one per API instance). `SKIP LOCKED` hands each a disjoint batch, so without a crash nothing is sent twice.
+
+**Ordering.** Each batch is published in id order, but there is no global order guarantee. Ids are assigned at insert and commit in any order, and two publishers work on different batches concurrently. Events for one transfer never conflict (each transfer has one event), so consumers that need an order can use `created_at` or the transfer's entry ids.
+
+**If Redis is down,** publishing fails, events wait in Postgres, and the worker retries every tick. `outbox_lag_seconds` (the age of the oldest unpublished event) shows how stale consumers are, and `LedgerOutboxLag` alerts after 2 minutes over 60 seconds. The stream is capped at about 1,000,000 messages, so a consumer that far behind must resync from the database.
+
+**Tests.**
+- **Atomicity:** exactly one event per posted transfer or reversal, none for a rejection or a replay.
+- **Crash between publishing and marking:** the batch is delivered twice, and deduping by `event_id` yields each event exactly once.
+- **Redis down:** events wait and publish once Redis returns.
+- **Concurrent publishers:** four publishers draining together send 200 events exactly once.
+- **Property test:** under concurrent retries and Redis flushes, every transfer a client saw posted has exactly one event.
+
+**Not built:** pruning published rows (a periodic `DELETE ... WHERE published_at < now() - interval '7 days'` would do), and consumer groups on the stream.
 
 ## Reconciliation
 

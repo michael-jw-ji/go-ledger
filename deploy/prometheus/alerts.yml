@@ -27,3 +27,14 @@ groups:
           severity: ticket
         annotations:
           summary: "{{ $value }} hot-account entries waiting for the rollup worker"
+
+      # Events are safe in Postgres while they wait, but consumers are
+      # working from stale information.
+      - alert: LedgerOutboxLag
+        expr: outbox_lag_seconds > 60
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Oldest unpublished ledger event is {{ $value }}s old"
+          description: "Check Redis and outbox_publish_failures_total."

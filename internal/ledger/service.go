@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -218,8 +219,30 @@ func (s *Service) postTx(ctx context.Context, key string, hash []byte, legs []Le
 		c := string(t.ErrorCode)
 		errCode = &c
 	}
-	if _, err := tx.Exec(ctx, `UPDATE transfers SET status = $2, error_code = $3 WHERE id = $1`,
-		t.ID, string(t.Status), errCode); err != nil {
+	// The event commits or rolls back with the entries, so other systems
+	// hear about exactly the transfers that moved money. Rejections move
+	// nothing and publish nothing; replays never reach this point. It shares
+	// one statement with the status update: the account row locks are still
+	// held here, and every extra round trip lengthens how long they are.
+	var eventType *string
+	var payload []byte
+	if t.Status == StatusPosted {
+		et := EventTransferPosted
+		if reverses != nil {
+			et = EventTransferReversed
+		}
+		eventType = &et
+		if payload, err = json.Marshal(t); err != nil {
+			return Transfer{}, err
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH u AS (
+		    UPDATE transfers SET status = $2, error_code = $3 WHERE id = $1
+		)
+		INSERT INTO outbox (event_type, aggregate_id, payload)
+		SELECT $4, $1, $5 WHERE $4::text IS NOT NULL`,
+		t.ID, string(t.Status), errCode, eventType, payload); err != nil {
 		return Transfer{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

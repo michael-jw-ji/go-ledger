@@ -87,6 +87,12 @@ type TransferRequest struct {
 	Fingerprint []byte
 }
 
+// Outbox event types, written in the same transaction as the transfer.
+const (
+	EventTransferPosted   = "transfer.posted"
+	EventTransferReversed = "transfer.reversed"
+)
+
 // Status is the outcome of a transfer. Pending only exists inside the
 // posting transaction and is never visible to readers.
 type Status string

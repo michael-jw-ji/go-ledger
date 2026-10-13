@@ -331,6 +331,25 @@ func runProperty(t *testing.T, flushRedis bool) {
 	// The production reconciliation job must agree.
 	assertReconClean(t)
 
+	// Every transfer a client saw posted has exactly one outbox event, no
+	// matter how many times its key was retried; rejections have none.
+	var postedIDs []string
+	for _, seen := range results {
+		if seen[0].status == http.StatusCreated {
+			postedIDs = append(postedIDs, seen[0].transferID)
+		}
+	}
+	var events, distinct int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), count(DISTINCT aggregate_id) FROM outbox
+		WHERE aggregate_id::text = ANY($1)`, keysToTransferIDs(results)).Scan(&events, &distinct); err != nil {
+		t.Fatal(err)
+	}
+	if events != len(postedIDs) || distinct != len(postedIDs) {
+		t.Fatalf("outbox has %d events (%d distinct) for this run's transfers, want one per posted transfer (%d)",
+			events, distinct, len(postedIDs))
+	}
+
 	// Draining the rest changes cached balances but no effective ones.
 	n, err := rollup.Once(ctx, pool)
 	if err != nil {
@@ -528,4 +547,16 @@ func assertBalancesMatchEntries(t *testing.T, ids []int64) {
 	if n != len(ids) {
 		t.Errorf("checked %d accounts, want %d", n, len(ids))
 	}
+}
+
+// keysToTransferIDs lists the transfer id each key resolved to, posted or
+// rejected, so outbox queries can be scoped to this run.
+func keysToTransferIDs(results [][]outcome) []string {
+	ids := make([]string, 0, len(results))
+	for _, seen := range results {
+		if seen[0].transferID != "" {
+			ids = append(ids, seen[0].transferID)
+		}
+	}
+	return ids
 }

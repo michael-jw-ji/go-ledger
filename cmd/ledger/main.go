@@ -1,7 +1,7 @@
 // Command ledger runs the ledger HTTP API.
 //
-//	ledger         serve the API, with the reconciliation and hot-account
-//	               rollup workers in the background
+//	ledger         serve the API, with the reconciliation, hot-account
+//	               rollup and outbox workers in the background
 //	ledger recon   reconcile once, print the result, exit 1 on mismatches
 package main
 
@@ -27,6 +27,7 @@ import (
 	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
 	"github.com/michael-jw-ji/go-ledger/internal/metrics"
+	"github.com/michael-jw-ji/go-ledger/internal/outbox"
 	"github.com/michael-jw-ji/go-ledger/internal/recon"
 	"github.com/michael-jw-ji/go-ledger/internal/rollup"
 	"github.com/michael-jw-ji/go-ledger/migrations"
@@ -114,6 +115,10 @@ func serve(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("ROLLUP_INTERVAL: %w", err)
 	}
+	outboxInterval, err := time.ParseDuration(env("OUTBOX_INTERVAL", "200ms"))
+	if err != nil {
+		return fmt.Errorf("OUTBOX_INTERVAL: %w", err)
+	}
 
 	redisOpts, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6379/0"))
 	if err != nil {
@@ -140,6 +145,13 @@ func serve(log *slog.Logger) error {
 	rollupWorker := &rollup.Worker{Pool: pool, Interval: rollupInterval, Log: log, OnTick: m.OnRollup}
 	workers.Go(func() { reconWorker.Run(ctx) })
 	workers.Go(func() { rollupWorker.Run(ctx) })
+	outboxWorker := &outbox.Worker{
+		Publisher: &outbox.Publisher{Pool: pool, Redis: rdb, Stream: env("OUTBOX_STREAM", outbox.DefaultStream)},
+		Interval:  outboxInterval,
+		Log:       log,
+		OnTick:    m.OnOutbox,
+	}
+	workers.Go(func() { outboxWorker.Run(ctx) })
 
 	srv := &http.Server{
 		Addr:              env("ADDR", ":8088"),
@@ -151,7 +163,8 @@ func serve(log *slog.Logger) error {
 	errc := make(chan error, 1)
 	go func() {
 		log.Info("listening", "addr", srv.Addr,
-			"recon_interval", reconInterval.String(), "rollup_interval", rollupInterval.String())
+			"recon_interval", reconInterval.String(), "rollup_interval", rollupInterval.String(),
+			"outbox_interval", outboxInterval.String())
 		errc <- srv.ListenAndServe()
 	}()
 
