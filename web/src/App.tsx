@@ -9,6 +9,8 @@ import { RequestLogPanel } from './components/RequestLogPanel'
 
 type Tab = 'accounts' | 'transfer' | 'ledger' | 'log'
 
+const isLocal = ['localhost', '127.0.0.1'].includes(location.hostname)
+
 export default function App() {
   const health = useHealth()
   const accountsQ = useAccounts()
@@ -74,8 +76,17 @@ export default function App() {
 
       {!online && !health.isPending && (
         <div className="callout" role="alert">
-          <strong>API not reachable.</strong> Start it with <code>make up</code> then <code>make run</code> (it listens on{' '}
-          <code>:8088</code>). This page retries every 5 seconds.
+          {isLocal ? (
+            <>
+              <strong>API not reachable.</strong> Start it with <code>make up</code> then <code>make run</code> (it listens
+              on <code>:8088</code>). This page retries every 5 seconds.
+            </>
+          ) : (
+            <>
+              <strong>The demo server is waking up.</strong> It runs on a free tier that sleeps when idle, so the first
+              request can take up to a minute. This page retries every 5 seconds.
+            </>
+          )}
         </div>
       )}
 
@@ -163,7 +174,7 @@ export default function App() {
 
       <footer className="footer">
         <span>AMOUNTS IN MINOR UNITS · ENTRIES APPEND-ONLY</span>
-        <span>API → localhost:8088 via /api</span>
+        <span>API → {location.host}/api</span>
       </footer>
     </div>
   )

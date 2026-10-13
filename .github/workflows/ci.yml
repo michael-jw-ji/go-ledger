@@ -46,3 +46,10 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npx vite build
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: build the deploy image
+        run: docker build -t go-ledger:ci .

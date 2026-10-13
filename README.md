@@ -52,6 +52,19 @@ curl -X POST localhost:8088/transfers -H 'Idempotency-Key: fund-alice-1' \
 # Send the same request again: same transfer, with Idempotent-Replayed: true
 ```
 
+## Deploy
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/michael-jw-ji/go-ledger)
+
+The `Dockerfile` builds one image with the API and the web console: the console is served at `/` and the API under `/api`. [`render.yaml`](render.yaml) is a Render Blueprint that creates that web service, a Postgres database and a Redis-compatible Key Value store, all on free plans. Migrations run at startup, so there's nothing else to set up.
+
+Things to know about the free plans:
+- **Sleep.** The web service sleeps after a period without traffic, and the first request after that takes up to a minute while it wakes. The console says so while it waits.
+- **Database expiry.** Render's free Postgres has had an expiry date. Check the current terms, or point `DATABASE_URL` at another free Postgres such as Neon.
+- **Open access.** The demo has no authentication, so anyone with the URL can create accounts and transfers. That's fine for a demo of fake money, but don't reuse it for anything real.
+
+To run the same image locally: `docker build -t go-ledger . && docker run -p 8088:8088 -e DATABASE_URL=... -e REDIS_URL=... go-ledger`. The API also honors `PORT` when `ADDR` isn't set.
+
 ## Commands
 
 | Command | What it does |

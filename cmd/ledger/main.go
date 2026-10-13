@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -154,8 +155,8 @@ func serve(log *slog.Logger) error {
 	workers.Go(func() { outboxWorker.Run(ctx) })
 
 	srv := &http.Server{
-		Addr:              env("ADDR", ":8088"),
-		Handler:           m.Instrument(mux),
+		Addr:              listenAddr(),
+		Handler:           withConsole(m.Instrument(mux), os.Getenv("WEB_DIR")),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -201,6 +202,40 @@ func latestRecon(pool *pgxpool.Pool, log *slog.Logger) http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(res)
 		}
 	}
+}
+
+// listenAddr is ADDR, else :$PORT (set by hosts like Render), else :8088.
+func listenAddr() string {
+	if a := os.Getenv("ADDR"); a != "" {
+		return a
+	}
+	if p := os.Getenv("PORT"); p != "" {
+		return ":" + p
+	}
+	return ":8088"
+}
+
+// withConsole serves the built web console from dir and mounts the API
+// under /api, the same layout the Vite dev proxy gives the console locally.
+// With no dir, the API is served at the root as usual.
+func withConsole(api http.Handler, dir string) http.Handler {
+	if dir == "" {
+		return api
+	}
+	files := http.FileServer(http.Dir(dir))
+	root := http.NewServeMux()
+	root.Handle("/api/", http.StripPrefix("/api", api))
+	root.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hashed asset names never change, so they can be cached for good;
+		// index.html must be revalidated so a deploy shows up.
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		files.ServeHTTP(w, r)
+	}))
+	return root
 }
 
 func env(key, fallback string) string {
