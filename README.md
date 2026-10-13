@@ -91,7 +91,7 @@ Amounts are integers in minor units (cents). Status codes:
 | 404 | Unknown account or transfer |
 | 400 | Malformed body or missing key |
 
-A rejected transfer is recorded, so retrying its key returns the same 422.
+A rejected transfer is recorded, so retrying its key returns the same 422. A request rejected by validation (400, `unbalanced`, `validation_error`) never reached the ledger and doesn't use up its key. A retry must resend the same request: formatting may differ, but values and shape may not.
 
 ## Observability
 

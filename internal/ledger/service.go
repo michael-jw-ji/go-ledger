@@ -101,13 +101,21 @@ func (s *Service) CreateTransfer(ctx context.Context, req TransferRequest) (Tran
 	if err := req.Validate(); err != nil {
 		return Transfer{}, err
 	}
-	return s.post(ctx, req.IdempotencyKey, RequestHash(req.Legs), req.Legs, nil)
+	fp := req.Fingerprint
+	if len(fp) == 0 {
+		fp = RequestHash(req.Legs)
+	}
+	return s.post(ctx, req.IdempotencyKey, fp, req.Legs, nil)
 }
 
 // ReverseTransfer posts the mirror image of a posted transfer. The key is
 // scoped to the transfer, so the same client key can be reused across
 // different reversals.
-func (s *Service) ReverseTransfer(ctx context.Context, id uuid.UUID, idempotencyKey string) (Transfer, error) {
+//
+// fingerprint identifies the request, as in TransferRequest. If empty, it
+// defaults to the fingerprint of an empty HTTP body, so direct callers and
+// body-less HTTP requests agree.
+func (s *Service) ReverseTransfer(ctx context.Context, id uuid.UUID, idempotencyKey string, fingerprint []byte) (Transfer, error) {
 	if idempotencyKey == "" || len(idempotencyKey) > maxKeyLen {
 		return Transfer{}, invalid("idempotency key must be 1 to %d characters", maxKeyLen)
 	}
@@ -126,8 +134,11 @@ func (s *Service) ReverseTransfer(ctx context.Context, id uuid.UUID, idempotency
 		legs[i] = Leg{AccountID: e.AccountID, Direction: e.Direction.Opposite(), Amount: e.Amount}
 	}
 	key := "reverse:" + id.String() + ":" + idempotencyKey
-	hash := sha256.Sum256([]byte("reverse:" + id.String()))
-	return s.post(ctx, key, hash[:], legs, &id)
+	if len(fingerprint) == 0 {
+		empty := sha256.Sum256(nil)
+		fingerprint = empty[:]
+	}
+	return s.post(ctx, key, fingerprint, legs, &id)
 }
 
 // post runs the whole transfer in one transaction:

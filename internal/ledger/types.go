@@ -80,6 +80,11 @@ func (l Leg) delta(normal Side) int64 {
 type TransferRequest struct {
 	IdempotencyKey string
 	Legs           []Leg
+	// Fingerprint identifies the request for the idempotency check: a retry
+	// under the same key must carry the same fingerprint. The HTTP layer
+	// passes idempotency.Fingerprint of the body, the same value Redis
+	// compares. If empty, RequestHash(Legs) is used.
+	Fingerprint []byte
 }
 
 // Status is the outcome of a transfer. Pending only exists inside the

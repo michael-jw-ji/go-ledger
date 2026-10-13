@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -55,8 +54,7 @@ func TestInProgressKeyReturns409(t *testing.T) {
 	key := uniq("idem")
 
 	// Simulate another request holding the key.
-	hash := sha256.Sum256([]byte(body))
-	if _, _, err := idempotency.NewStore(rdb).Claim(ctx, redisKey(key), hash[:]); err != nil {
+	if _, _, err := idempotency.NewStore(rdb).Claim(ctx, redisKey(key), idempotency.Fingerprint([]byte(body))); err != nil {
 		t.Fatal(err)
 	}
 

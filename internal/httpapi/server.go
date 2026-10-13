@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -55,7 +56,7 @@ func New(svc *ledger.Service, log *slog.Logger, idem *idempotency.Middleware) *h
 
 func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
 	var in ledger.NewAccount
-	if !decode(w, r, &in) {
+	if _, ok := decode(w, r, &in); !ok {
 		return
 	}
 	a, err := s.svc.CreateAccount(r.Context(), in)
@@ -143,7 +144,8 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body transferBody
-	if !decode(w, r, &body) {
+	raw, ok := decode(w, r, &body)
+	if !ok {
 		return
 	}
 	if len(body.Entries) > 0 && (body.DebitAccountID != 0 || body.CreditAccountID != 0 || body.Amount != 0) {
@@ -151,7 +153,11 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 			"send either entries or debit_account_id/credit_account_id/amount, not both")
 		return
 	}
-	t, err := s.svc.CreateTransfer(r.Context(), ledger.TransferRequest{IdempotencyKey: key, Legs: body.legs()})
+	t, err := s.svc.CreateTransfer(r.Context(), ledger.TransferRequest{
+		IdempotencyKey: key,
+		Legs:           body.legs(),
+		Fingerprint:    idempotency.Fingerprint(raw),
+	})
 	s.writeTransfer(w, r, t, err)
 }
 
@@ -177,7 +183,14 @@ func (s *Server) reverseTransfer(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	t, err := s.svc.ReverseTransfer(r.Context(), id, key)
+	// A reversal has no parameters, but the body is still part of the
+	// request's fingerprint, matching what the Redis layer compares.
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "request body is too large")
+		return
+	}
+	t, err := s.svc.ReverseTransfer(r.Context(), id, key, idempotency.Fingerprint(raw))
 	s.writeTransfer(w, r, t, err)
 }
 
@@ -188,6 +201,8 @@ func (s *Server) writeTransfer(w http.ResponseWriter, r *http.Request, t ledger.
 		s.writeErr(w, r, err)
 		return
 	}
+	// Postgres holds this outcome under the key, so Redis may cache it.
+	idempotency.MarkRecorded(r.Context())
 	if t.Replayed {
 		w.Header().Set(replayedHeader, "true")
 	}
@@ -236,18 +251,25 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+// decode parses the body into v and also returns the raw bytes, which the
+// transfer handlers fingerprint for idempotency.
+func decode(w http.ResponseWriter, r *http.Request, v any) ([]byte, bool) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "request body is too large")
+		return nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		writeError(w, http.StatusBadRequest, "malformed_json", err.Error())
-		return false
+		return nil, false
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "malformed_json", "body must be a single JSON object")
-		return false
+		return nil, false
 	}
-	return true
+	return raw, true
 }
 
 func requireKey(w http.ResponseWriter, r *http.Request) (string, bool) {

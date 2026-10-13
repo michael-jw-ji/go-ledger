@@ -1,9 +1,9 @@
 // Package idempotency is the fast path for Idempotency-Key handling.
 //
 // Redis remembers each key's state (in progress, or done with the stored
-// response). It is an optimization, not the source of truth: if Redis loses a
-// key, the request falls through to Postgres, whose UNIQUE idempotency_key
-// returns the original result. See DESIGN.md.
+// response). It is a cache of what Postgres recorded, not the source of
+// truth: if Redis loses a key, the request falls through to Postgres, whose
+// UNIQUE idempotency_key returns the original result. See DESIGN.md.
 package idempotency
 
 import (
@@ -79,13 +79,27 @@ func (s *Store) Claim(ctx context.Context, key string, hash []byte) (existing *R
 	return nil, "", errors.New("idempotency: key churned during claim")
 }
 
-// Complete stores the final response for replay.
-func (s *Store) Complete(ctx context.Context, key string, hash []byte, status int, body []byte) error {
+// completeScript stores a final response, but only over our own claim or an
+// empty key. If our claim expired and another request now holds the key (or
+// already finished it), that request's record stays. Both describe the same
+// Postgres outcome, so this is tidiness, not safety.
+var completeScript = redis.NewScript(`
+local v = redis.call("GET", KEYS[1])
+if v then
+  local rec = cjson.decode(v)
+  if rec.state ~= "in_progress" or rec.token ~= ARGV[1] then return 0 end
+end
+redis.call("SET", KEYS[1], ARGV[2], "PX", ARGV[3])
+return 1`)
+
+// Complete stores the final response for replay, if the key still holds the
+// claim identified by token (or has expired).
+func (s *Store) Complete(ctx context.Context, key, token string, hash []byte, status int, body []byte) error {
 	val, err := json.Marshal(Record{State: stateDone, Hash: hash, Status: status, Body: body})
 	if err != nil {
 		return err
 	}
-	return s.rdb.Set(ctx, key, val, s.DoneTTL).Err()
+	return completeScript.Run(ctx, s.rdb, []string{key}, token, val, s.DoneTTL.Milliseconds()).Err()
 }
 
 // releaseScript deletes the key only if it still holds our in-progress claim,
@@ -100,7 +114,8 @@ end
 return 0`)
 
 // Release frees an in-progress claim so the client can retry, used when the
-// request failed in a way that is safe to retry (5xx).
+// response isn't an outcome Postgres recorded (a 5xx, or a request rejected
+// before it reached the ledger).
 func (s *Store) Release(ctx context.Context, key, token string) error {
 	return releaseScript.Run(ctx, s.rdb, []string{key}, token).Err()
 }

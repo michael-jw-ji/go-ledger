@@ -140,7 +140,7 @@ func TestReversalRestoresBalances(t *testing.T) {
 	pay := transfer(t, uniq("k"), move(alice.ID, bob.ID, 300))
 
 	key := uniq("k")
-	rev, err := svc.ReverseTransfer(ctx, pay.ID, key)
+	rev, err := svc.ReverseTransfer(ctx, pay.ID, key, nil)
 	if err != nil {
 		t.Fatalf("reverse: %v", err)
 	}
@@ -150,14 +150,14 @@ func TestReversalRestoresBalances(t *testing.T) {
 	wantBalance(t, alice.ID, 1000)
 	wantBalance(t, bob.ID, 0)
 
-	again, err := svc.ReverseTransfer(ctx, pay.ID, key)
+	again, err := svc.ReverseTransfer(ctx, pay.ID, key, nil)
 	if err != nil || again.ID != rev.ID || !again.Replayed {
 		t.Fatalf("same key replay = %+v, %v", again, err)
 	}
-	if _, err := svc.ReverseTransfer(ctx, pay.ID, uniq("k")); !errors.Is(err, ledger.ErrAlreadyReversed) {
+	if _, err := svc.ReverseTransfer(ctx, pay.ID, uniq("k"), nil); !errors.Is(err, ledger.ErrAlreadyReversed) {
 		t.Fatalf("second reversal with a new key: got %v, want ErrAlreadyReversed", err)
 	}
-	if _, err := svc.ReverseTransfer(ctx, rev.ID, uniq("k")); !errors.Is(err, ledger.ErrNotReversible) {
+	if _, err := svc.ReverseTransfer(ctx, rev.ID, uniq("k"), nil); !errors.Is(err, ledger.ErrNotReversible) {
 		t.Fatalf("reversing a reversal: got %v, want ErrNotReversible", err)
 	}
 	wantBalance(t, alice.ID, 1000)
@@ -172,14 +172,14 @@ func TestRejectedReversalCanBeRetried(t *testing.T) {
 	pay := transfer(t, uniq("k"), move(alice.ID, bob.ID, 300))
 	out := transfer(t, uniq("k"), move(bob.ID, funding.ID, 300))
 
-	rev, err := svc.ReverseTransfer(ctx, pay.ID, uniq("k"))
+	rev, err := svc.ReverseTransfer(ctx, pay.ID, uniq("k"), nil)
 	if err != nil || rev.Status != ledger.StatusRejected || rev.ErrorCode != ledger.CodeInsufficientFunds {
 		t.Fatalf("reversal with bob empty = %+v, %v", rev, err)
 	}
-	if _, err := svc.ReverseTransfer(ctx, out.ID, uniq("k")); err != nil {
+	if _, err := svc.ReverseTransfer(ctx, out.ID, uniq("k"), nil); err != nil {
 		t.Fatalf("reverse bob's payout: %v", err)
 	}
-	rev, err = svc.ReverseTransfer(ctx, pay.ID, uniq("k"))
+	rev, err = svc.ReverseTransfer(ctx, pay.ID, uniq("k"), nil)
 	if err != nil || rev.Status != ledger.StatusPosted {
 		t.Fatalf("retried reversal = %+v, %v", rev, err)
 	}

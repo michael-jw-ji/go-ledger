@@ -16,43 +16,43 @@ func TestTransferRequestValidate(t *testing.T) {
 		req  TransferRequest
 		want error
 	}{
-		{"balanced two-leg", TransferRequest{"k", ok}, nil},
-		{"balanced multi-leg", TransferRequest{"k", []Leg{
+		{"balanced two-leg", TransferRequest{IdempotencyKey: "k", Legs: ok}, nil},
+		{"balanced multi-leg", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: Debit, Amount: 100},
 			{AccountID: 2, Direction: Credit, Amount: 60},
 			{AccountID: 3, Direction: Credit, Amount: 40},
 		}}, nil},
-		{"unbalanced", TransferRequest{"k", []Leg{
+		{"unbalanced", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: Debit, Amount: 100},
 			{AccountID: 2, Direction: Credit, Amount: 99},
 		}}, ErrUnbalanced},
-		{"all debits", TransferRequest{"k", []Leg{
+		{"all debits", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: Debit, Amount: 100},
 			{AccountID: 2, Direction: Debit, Amount: 100},
 		}}, ErrUnbalanced},
-		{"missing key", TransferRequest{"", ok}, ErrInvalidRequest},
-		{"single leg", TransferRequest{"k", ok[:1]}, ErrInvalidRequest},
-		{"zero amount", TransferRequest{"k", []Leg{
+		{"missing key", TransferRequest{IdempotencyKey: "", Legs: ok}, ErrInvalidRequest},
+		{"single leg", TransferRequest{IdempotencyKey: "k", Legs: ok[:1]}, ErrInvalidRequest},
+		{"zero amount", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: Debit, Amount: 0},
 			{AccountID: 2, Direction: Credit, Amount: 0},
 		}}, ErrInvalidRequest},
-		{"negative amount", TransferRequest{"k", []Leg{
+		{"negative amount", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: Debit, Amount: -5},
 			{AccountID: 2, Direction: Credit, Amount: -5},
 		}}, ErrInvalidRequest},
-		{"amount over max", TransferRequest{"k", []Leg{
+		{"amount over max", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: Debit, Amount: MaxAmount + 1},
 			{AccountID: 2, Direction: Credit, Amount: MaxAmount + 1},
 		}}, ErrInvalidRequest},
-		{"bad direction", TransferRequest{"k", []Leg{
+		{"bad direction", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: "sideways", Amount: 100},
 			{AccountID: 2, Direction: Credit, Amount: 100},
 		}}, ErrInvalidRequest},
-		{"same account both sides", TransferRequest{"k", []Leg{
+		{"same account both sides", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{AccountID: 1, Direction: Debit, Amount: 100},
 			{AccountID: 1, Direction: Credit, Amount: 100},
 		}}, ErrInvalidRequest},
-		{"missing account", TransferRequest{"k", []Leg{
+		{"missing account", TransferRequest{IdempotencyKey: "k", Legs: []Leg{
 			{Direction: Debit, Amount: 100},
 			{AccountID: 2, Direction: Credit, Amount: 100},
 		}}, ErrInvalidRequest},

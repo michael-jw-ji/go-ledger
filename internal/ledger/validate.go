@@ -78,7 +78,9 @@ func validateLegs(legs []Leg) error {
 }
 
 // RequestHash fingerprints the legs so that reusing an idempotency key with a
-// different request can be detected.
+// different request can be detected. It is the default for callers that
+// don't pass TransferRequest.Fingerprint; HTTP requests use the body's
+// fingerprint instead.
 func RequestHash(legs []Leg) []byte {
 	b, err := json.Marshal(legs)
 	if err != nil {

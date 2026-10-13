@@ -48,11 +48,18 @@ COMMIT
 
 **Defense in depth.** A `CHECK (allow_negative OR balance >= 0)` on `accounts` catches any overdraft bug the service-level check misses, and `entries.amount > 0` is also a constraint.
 
-**Reversals** post the mirror image of a posted transfer. Their key is derived as `reverse:{transfer id}:{client key}` and their hash as `sha256("reverse:" + id)`. A partial unique index on `reverses_transfer_id` (ignoring rejected attempts) allows at most one successful reversal per transfer. A reversal that failed for insufficient funds can be retried. Reversing a reversal is refused.
+**Reversals** post the mirror image of a posted transfer. Their key is derived as `reverse:{transfer id}:{client key}`, and their fingerprint is that of the (normally empty) request body. A partial unique index on `reverses_transfer_id` (ignoring rejected attempts) allows at most one successful reversal per transfer. A reversal that failed for insufficient funds can be retried. Reversing a reversal is refused.
 
 ## Idempotency
 
-Clients send an `Idempotency-Key` header on every `POST /transfers` and `POST /transfers/{id}/reverse`. Two layers enforce it. Redis is the fast layer and handles the common cases. Postgres is the backstop that makes the guarantee hold even when Redis forgets.
+Clients send an `Idempotency-Key` header on every `POST /transfers` and `POST /transfers/{id}/reverse`. Two layers enforce it. Postgres is the source of truth. Redis is a cache in front of it that answers replays and in-flight duplicates quickly.
+
+Two rules keep the layers from ever disagreeing:
+
+1. **One fingerprint.** `idempotency.Fingerprint` hashes the request body after re-encoding the JSON (object keys sorted, whitespace dropped, numbers as written). The middleware compares it in Redis, and the handler passes the same value to the ledger, which stores it as `transfers.request_hash`. Formatting differences don't count as a different request in either layer. A different value, or the same legs in a different shape (the two-leg shorthand vs explicit `entries`, or reordered legs), counts as different in both. A retry must resend the request it sent.
+2. **Redis caches only what Postgres recorded.** The handler marks a response as recorded when the ledger returned a transfer: posted, rejected or replayed. Anything else releases the Redis claim instead of storing it: a 5xx, or a request rejected before it reached the ledger, such as malformed JSON or unbalanced legs. Stripe follows the same rule: requests that fail validation never started executing, so they don't use up the key.
+
+Together these mean a retry gets the same answer whether Redis still remembers the key, has forgotten it, or is down. `TestReformattedRetryGetsSameAnswerFromBothLayers`, `TestRejectedBeforeLedgerDoesNotBurnKey` and `TestReversalFingerprintMatchesAcrossLayers` check each case against both layers by deleting the Redis key between attempts. Mutation checks confirmed the tests fail if either rule is broken.
 
 ### Postgres backstop
 
@@ -60,13 +67,13 @@ Clients send an `Idempotency-Key` header on every `POST /transfers` and `POST /t
 
 - **Sequential retry.** The key already exists, no row comes back, and the service returns the stored transfer with `Idempotent-Replayed: true`.
 - **Concurrent duplicate.** The second insert blocks on the unique index until the first transaction commits, then returns no row and replays the result. Two posts for one key are impossible, whatever the timing.
-- **Different request, same key.** The stored `request_hash` differs, so the request gets 422 `idempotency_key_reused`.
+- **Different request, same key.** The stored `request_hash` (the fingerprint) differs, so the request gets 422 `idempotency_key_reused`.
 
 **Rejections are recorded, not rolled back.** The obvious design rolls back the whole transaction on insufficient funds. That leaves no trace of the key, so a retry with the same key after funds arrive would post. The client would see a 422 and later a 201 for one key. Instead, business-rule failures (insufficient funds, currency mismatch, unknown account) roll back only to the savepoint taken after the transfer row was inserted. The transfer is then committed as `rejected` with its `error_code` and no entries.
 
 The key is held by the unique index the whole time, so a retry can't slip in between the rejection and the commit. Retries replay the same 422 indefinitely, with or without Redis. `TestRejectedKeyReplaysAfterFundsArrive` covers this.
 
-Validation failures (malformed JSON, unbalanced legs, bad amounts) are rejected before the transaction starts and are not recorded. They are a pure function of the body, so a retry always fails the same way.
+Validation failures (malformed JSON, unbalanced legs, bad amounts) are rejected before the transaction starts and are not recorded, in either layer. Retrying the same bad body fails the same way. Correcting it and retrying under the same key posts normally.
 
 ### Redis layer
 
@@ -74,22 +81,22 @@ Validation failures (malformed JSON, unbalanced legs, bad amounts) are rejected 
 
 | Redis state for the key | Response |
 |---|---|
-| absent | `SET NX` an in-progress claim (30s TTL), run the handler, store the response for 24h |
-| done, same request hash | replay the stored status and body, `Idempotent-Replayed: true` |
+| absent | `SET NX` an in-progress claim (30s TTL), run the handler, store the response for 24h if Postgres recorded it, otherwise release the claim |
+| done, same fingerprint | replay the stored status and body, `Idempotent-Replayed: true` |
 | in progress | 409 `request_in_progress` with `Retry-After: 1` |
-| either state, different hash | 422 `idempotency_key_reused` |
+| either state, different fingerprint | 422 `idempotency_key_reused` |
 
 Some details:
 - **Endpoint scoping.** Keys are scoped by method and path (`idem:POST /transfers:{key}`), so one client key can be reused across different endpoints.
-- **4xx responses are stored.** They are deterministic.
-- **5xx responses release the claim** so the client can retry. A Lua script checks a per-claim token, so a slow request whose claim already expired can't delete a newer claim.
+- **Business rejections are stored** (a 422 for insufficient funds is a recorded outcome). Validation failures and 5xx responses release the claim, so the client can retry.
+- **Claims are token-checked.** Each claim carries a random token. Lua scripts make both `Release` and `Complete` act only on the request's own claim, so a slow request whose claim expired can't delete or overwrite a newer request's claim. `Complete` still writes to a key that has expired with nobody holding it, because the outcome it stores is already in Postgres.
 - **Disconnects.** The store calls use `context.WithoutCancel`, so the result is still recorded when the client disconnects mid-request. The transfer may have committed.
 
 ### Failure cases
 
 **The process crashes after the Postgres commit, before the Redis write.** The key stays `in_progress` in Redis until its 30-second TTL expires, and clients get 409 until then. The first retry after expiry claims the key, reaches Postgres, finds the committed transfer and replays it. The client sees a delay but never a double post. The 30-second TTL is the trade-off: a shorter one recovers faster but risks expiring under a slow-but-alive request.
 
-**A request outlives its 30-second claim.** A second request can then claim the key and run. Postgres serializes the two on the unique index: one posts, and the other waits and replays. Both clients get the same transfer. Whichever finishes last overwrites the Redis record with an equivalent response (`Complete` is not token-checked; only `Release` needs to be).
+**A request outlives its 30-second claim.** A second request can then claim the key and run. Postgres serializes the two on the unique index: one posts, and the other waits and replays. Both clients get the same transfer. The second request's claim is the one in Redis, so the slow request's token-checked `Complete` leaves it alone, and the second request stores the result. Both responses describe the same Postgres outcome either way.
 
 **Redis is down.** Lookups fail open: the handler runs directly, `idempotency_lookups_total{result="redis_error"}` counts it, and Postgres alone enforces idempotency. Latency rises, because duplicates now reach the database, but correctness is unchanged. `TestRedisDownFallsBackToPostgres` covers this.
 
@@ -97,16 +104,7 @@ Some details:
 
 As a mutation check, the Postgres key was briefly made unique per attempt so the backstop couldn't match, and the flush variant failed as it should.
 
-**The same key is reused with a different body.** Both layers return 422 `idempotency_key_reused`, but they fingerprint different things:
-
-- **Redis** hashes the raw request body.
-- **Postgres** hashes the parsed legs in request order (`json.Marshal([]Leg)`).
-
-So the two layers can disagree about equivalent requests:
-- The two-leg shorthand and the equivalent explicit `entries` body, or the same JSON with different whitespace, are the same request to Postgres but different to Redis. Within Redis's 24-hour window such a retry gets 422. After that window, or with Redis down, it replays.
-- The same legs in a different order are different to both layers.
-
-The rule for clients is the usual one: a retry must resend the identical request. The asymmetry only ever produces a spurious 422, never a double post.
+**The same key is reused with a different body.** Both layers compare the same fingerprint, so both return 422 `idempotency_key_reused`. That holds within Redis's 24-hour window, after it, and with Redis down.
 
 ## Hot accounts
 
@@ -185,4 +183,4 @@ The ledger package depends on no metrics library. It exposes plain hook function
 | Web (Vitest + Testing Library) | A double click posts once, retries reuse the key, a 409 is retried automatically with the same key, and errors render. |
 | CI | gofmt, golangci-lint, unit tests and integration tests with `-race`, plus the web typecheck, tests and build. |
 
-Mutation checks were used to confirm the tests can fail. Disabling the Postgres backstop failed the flush variant. Skipping `hot_pending` inserts failed four hot-account tests.
+Mutation checks were used to confirm the tests can fail. Disabling the Postgres backstop failed the flush variant. Skipping `hot_pending` inserts failed four hot-account tests. Caching responses Postgres never recorded failed two fingerprint tests, and going back to a legs-only hash in Postgres failed the reformatted-retry test.

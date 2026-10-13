@@ -3,11 +3,11 @@ package idempotency
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 )
 
 const (
@@ -38,8 +38,11 @@ func NewMiddleware(store *Store, log *slog.Logger) *Middleware {
 
 // Wrap guards a POST handler:
 //
-//   - key free: claim it, run the handler, store the response (or release
-//     the claim on 5xx so the client can retry).
+//   - key free: claim it and run the handler. If the handler marked the
+//     response as an outcome Postgres recorded (MarkRecorded), store it for
+//     replay. Otherwise (a 5xx, or a request rejected before reaching the
+//     ledger) release the claim, so Redis never remembers a key that
+//     Postgres doesn't.
 //   - key done with the same request: replay the stored response.
 //   - key in progress: 409, the client should retry shortly.
 //   - key used with a different request: 422.
@@ -62,8 +65,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		// Scope the key to the endpoint, so one client key can be used for
 		// different transfers' reversals.
 		key := "idem:" + r.Method + " " + r.URL.Path + ":" + clientKey
-		sum := sha256.Sum256(body)
-		hash := sum[:]
+		hash := Fingerprint(body)
 
 		ctx := r.Context()
 		existing, token, err := m.store.Claim(ctx, key, hash)
@@ -95,19 +97,20 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		}
 
 		m.report(ResultMiss)
+		var recorded atomic.Bool
 		rec := &recorder{header: http.Header{}, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
+		next.ServeHTTP(rec, r.WithContext(context.WithValue(ctx, recordedKey{}, &recorded)))
 
 		// Finish even if the client hung up: the transfer may have committed.
 		storeCtx := context.WithoutCancel(ctx)
-		if rec.status >= 500 {
-			if err := m.store.Release(storeCtx, key, token); err != nil {
-				m.log.WarnContext(ctx, "idempotency release failed", "err", err)
+		if recorded.Load() && rec.status < 500 {
+			if err := m.store.Complete(storeCtx, key, token, hash, rec.status, rec.body.Bytes()); err != nil {
+				// The in-progress claim expires on its own, then retries
+				// reach the Postgres backstop.
+				m.log.WarnContext(ctx, "idempotency complete failed", "err", err)
 			}
-		} else if err := m.store.Complete(storeCtx, key, hash, rec.status, rec.body.Bytes()); err != nil {
-			// The in-progress claim expires on its own, then retries reach
-			// the Postgres backstop.
-			m.log.WarnContext(ctx, "idempotency complete failed", "err", err)
+		} else if err := m.store.Release(storeCtx, key, token); err != nil {
+			m.log.WarnContext(ctx, "idempotency release failed", "err", err)
 		}
 
 		for k, v := range rec.header {
