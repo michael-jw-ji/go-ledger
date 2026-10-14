@@ -2,6 +2,8 @@
 
 A double-entry payments ledger in Go and Postgres, built to show payments correctness under concurrency and failure:
 
+**Live demo:** https://go-ledger.onrender.com (free tier, so the first load can take about a minute to wake up). Try the console at `/`, or the API at `/api`.
+
 - **Every transfer balances.** Multi-leg transfers post atomically. Debits equal credits, and accounts without an overdraft allowance never go negative.
 - **Exactly-once posting.** Idempotency keys are enforced in two layers. Redis handles replays and in-flight duplicates. A Postgres backstop keeps the guarantee when Redis is down or flushed, and it covers rejected attempts too.
 - **Concurrency without deadlocks.** Row locks are taken in id order. A rollup scheme removes the row-lock bottleneck on hot accounts (a merchant receiving most payments) without buffering money in memory.
