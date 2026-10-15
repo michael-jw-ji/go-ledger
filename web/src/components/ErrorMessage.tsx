@@ -30,6 +30,12 @@ const COPY: Record<string, (e: ApiError) => string> = {
   already_reversed: () => 'This transfer has already been reversed. A transfer can be reversed at most once.',
   not_reversible: (e) => `This transfer can’t be reversed: ${e.message.replace(/^.*?: /, '')}.`,
   not_found: () => 'That account or transfer does not exist.',
+  // Demo limits and sandboxes, checked before the ledger records anything.
+  sandbox_limit: () =>
+    `Your sandbox is full (it caps accounts and transfers so the demo stays small). Reset it on the Break It tab to start a fresh one. ${FREE}`,
+  rate_limited: () => 'Too many writes from your address in a short time. Wait a few seconds and retry; the key is still free.',
+  invalid_sandbox: () => 'The sandbox id this page sent is not a UUID. Reload the page to get a fresh one.',
+  missing_sandbox: () => 'This action needs a sandbox, and the request did not name one. Reload the page.',
   // Transport and server failures: the outcome is unknown, so keep the key.
   internal: () => 'The API hit an internal error. The key is kept, so retrying is safe and cannot post twice.',
   network_error: () => 'Could not reach the API. The key is kept, so retrying is safe once it is back.',

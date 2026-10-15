@@ -11,6 +11,10 @@ var (
 	ErrIdempotencyMismatch = errors.New("idempotency key was already used with a different request")
 	ErrAlreadyReversed     = errors.New("transfer has already been reversed")
 	ErrNotReversible       = errors.New("transfer cannot be reversed")
+	// ErrSandboxLimit: the sandbox already holds as many accounts or
+	// transfers as one visitor may create. Nothing is recorded, so the key
+	// stays free.
+	ErrSandboxLimit = errors.New("sandbox limit reached")
 )
 
 // ErrorCode explains why a transfer was rejected. Rejections are recorded

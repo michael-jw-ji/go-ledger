@@ -17,6 +17,7 @@ export interface CallOptions {
   body?: unknown
   /** Sent as-is instead of JSON.stringify(body), to test formatting. */
   raw?: string
+  headers?: Record<string, string>
 }
 
 export interface Io {
@@ -35,12 +36,34 @@ export interface Scenario {
   id: string
   title: string
   summary: string
+  /** Needs the server's fault-injection endpoints (a `-tags chaos` build). */
+  chaos?: boolean
   run: (io: Io) => Promise<ScenarioResult>
+}
+
+/** Whether the server can inject faults. A default build answers 404. */
+export async function chaosAvailable(io: Io): Promise<boolean> {
+  const r = await io.call('GET', '/chaos')
+  return r.status === 200
+}
+
+export async function flushRedis(io: Io): Promise<number> {
+  const r = await io.call('POST', '/chaos/flush-redis')
+  const deleted = (r.body as { deleted?: number } | null)?.deleted
+  if (r.status !== 200 || typeof deleted !== 'number') throw failure('flushing Redis failed', r)
+  return deleted
+}
+
+/** Mismatches the sandbox's own reconciliation reports right now. */
+export async function findings(io: Io): Promise<{ kind: string; account_id?: number; cached: number; computed: number }[]> {
+  const r = await io.call('GET', '/invariants')
+  if (r.status !== 200) throw failure('could not read invariants', r)
+  return (r.body as { recon: { mismatches: { kind: string; account_id?: number; cached: number; computed: number }[] } }).recon.mismatches
 }
 
 export const liveIo: Io = {
   call: async (method, path, opts = {}) => {
-    const headers: Record<string, string> = { 'X-Sandbox-Id': sandboxId() }
+    const headers: Record<string, string> = { ...opts.headers, 'X-Sandbox-Id': sandboxId() }
     if (opts.key) headers['Idempotency-Key'] = opts.key
     let body: string | undefined = opts.raw
     if (body === undefined && opts.body !== undefined) {
@@ -70,6 +93,13 @@ export const liveIo: Io = {
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }
 
+/** Why a setup step failed, in words a visitor can act on. */
+export function failure(what: string, r: Call): Error {
+  if (r.code === 'rate_limited') return new Error(`${what}: too many writes from your address. Wait a few seconds and run it again.`)
+  if (r.code === 'sandbox_limit') return new Error(`${what}: your sandbox is full. Reset it and run again.`)
+  return new Error(`${what}: ${r.code ?? `HTTP ${r.status}`}`)
+}
+
 export function errorCode(body: unknown): string | undefined {
   const code = (body as { error?: { code?: unknown } } | null)?.error?.code
   return typeof code === 'string' ? code : undefined
@@ -84,7 +114,7 @@ export async function createAccount(io: Io, name: string, allowNegative: boolean
     body: { name, currency: 'USD', normal_balance: 'credit', allow_negative: allowNegative },
   })
   const id = (r.body as { id?: number } | null)?.id
-  if (r.status !== 201 || typeof id !== 'number') throw new Error(`could not create ${name}: HTTP ${r.status}`)
+  if (r.status !== 201 || typeof id !== 'number') throw failure(`could not create ${name}`, r)
   return id
 }
 

@@ -13,7 +13,10 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ledger ./cmd/ledger
+# GO_TAGS=chaos compiles in the demo's fault-injection endpoints
+# (internal/chaos). Leave it empty for any real deployment.
+ARG GO_TAGS=""
+RUN CGO_ENABLED=0 go build -tags "$GO_TAGS" -trimpath -ldflags="-s -w" -o /out/ledger ./cmd/ledger
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=api /out/ledger /app/ledger

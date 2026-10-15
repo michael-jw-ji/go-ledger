@@ -63,7 +63,7 @@ func Snapshot(ctx context.Context, pool *pgxpool.Pool, scope recon.Scope) (Repor
 
 	if err := tx.QueryRow(ctx, `
 		SELECT COUNT(*) FROM accounts a
-		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)`, args...).Scan(&rep.Accounts); err != nil {
+		WHERE `+scope.Filter("a.sandbox_id")+``, args...).Scan(&rep.Accounts); err != nil {
 		return Report{}, err
 	}
 
@@ -72,7 +72,7 @@ func Snapshot(ctx context.Context, pool *pgxpool.Pool, scope recon.Scope) (Repor
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'debit'), 0)::bigint,
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'credit'), 0)::bigint
 		FROM entries e JOIN accounts a ON a.id = e.account_id
-		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		WHERE `+scope.Filter("a.sandbox_id")+`
 		GROUP BY a.currency
 		ORDER BY a.currency`, args...)
 	if err != nil {
@@ -97,7 +97,7 @@ func Snapshot(ctx context.Context, pool *pgxpool.Pool, scope recon.Scope) (Repor
 		LEFT JOIN (
 		    SELECT account_id, SUM(signed_amount) AS total FROM hot_pending GROUP BY account_id
 		) p ON p.account_id = a.id
-		WHERE NOT a.allow_negative AND ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		WHERE NOT a.allow_negative AND `+scope.Filter("a.sandbox_id")+`
 		GROUP BY a.currency
 		ORDER BY a.currency`, args...)
 	if err != nil {
@@ -118,7 +118,7 @@ func Snapshot(ctx context.Context, pool *pgxpool.Pool, scope recon.Scope) (Repor
 	if err := tx.QueryRow(ctx, `
 		SELECT COUNT(*) FROM (
 		    SELECT t.idempotency_key FROM transfers t
-		    WHERE ($1 OR t.sandbox_id IS NOT DISTINCT FROM $2::text)
+		    WHERE `+scope.Filter("t.sandbox_id")+`
 		    GROUP BY t.idempotency_key HAVING COUNT(*) > 1
 		) d`, args...).Scan(&rep.KeysWithMultipleTransfers); err != nil {
 		return Report{}, err

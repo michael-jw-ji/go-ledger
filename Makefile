@@ -1,4 +1,4 @@
-.PHONY: up down obs run recon test test-integration lint web web-install web-test load-steady load-hot
+.PHONY: up down obs run run-chaos recon test test-integration test-chaos lint web web-install web-test load-steady load-hot
 
 # Stop Git Bash on Windows rewriting container paths like /app in docker args.
 export MSYS_NO_PATHCONV := 1
@@ -23,6 +23,10 @@ recon:
 run:
 	go run ./cmd/ledger
 
+# The API with the demo's fault-injection endpoints compiled in.
+run-chaos:
+	go run -tags chaos ./cmd/ledger
+
 test:
 	go test $(TESTFLAGS) ./...
 
@@ -30,9 +34,16 @@ test:
 test-integration:
 	go test $(TESTFLAGS) -tags=integration -count=1 ./test/...
 
+# The integration suite plus the chaos endpoints' tests.
+test-chaos:
+	go test $(TESTFLAGS) -tags=integration,chaos -count=1 ./test/...
+
+# Lints both builds: the default one and the chaos one.
 lint:
 	go vet ./...
+	go vet -tags chaos ./...
 	docker run --rm -v "$(CURDIR):/app" -w /app golangci/golangci-lint:v2.14.0 golangci-lint run --build-tags=integration
+	docker run --rm -v "$(CURDIR):/app" -w /app golangci/golangci-lint:v2.14.0 golangci-lint run --build-tags=integration,chaos
 
 # React test console on http://localhost:5173 (proxies /api to :8088).
 web-install:

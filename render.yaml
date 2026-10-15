@@ -17,6 +17,21 @@ services:
           type: keyvalue
           name: go-ledger-redis
           property: connectionString
+      # The public demo is built with the fault-injection endpoints, via the
+      # Dockerfile's ARG GO_TAGS. This relies on Render passing env vars to
+      # Docker builds as build args: after a deploy, GET /api/chaos should
+      # answer 200 (a default build answers 404).
+      - key: GO_TAGS
+        value: chaos
+      # Per-IP write limit. HOPS=1 assumes one proxy appends to
+      # X-Forwarded-For in front of the app; check a request's header after
+      # deploying, since a wrong value makes visitors share a bucket.
+      - key: WRITE_RATE_PER_IP
+        value: "5"
+      - key: WRITE_BURST_PER_IP
+        value: "150"
+      - key: RATE_LIMIT_PROXY_HOPS
+        value: "1"
 
   - type: keyvalue
     name: go-ledger-redis

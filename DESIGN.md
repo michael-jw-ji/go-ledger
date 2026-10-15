@@ -194,12 +194,23 @@ The public demo has no login, so every visitor gets a sandbox: a random UUID the
 
 - **Isolation.** A transfer that names an account from another sandbox is rejected as `account_not_found`, and recorded like any other rejection. Reads of another sandbox's account or transfer return 404.
 - **Idempotency keys.** The Postgres key becomes `sb:{sandbox}:{key}` and the Redis key `idem:{sandbox}:{METHOD path}:{key}`. Two visitors can use the same key without colliding.
-- **Scoped checks.** `GET /invariants` runs the reconciliation checks for one sandbox, in the same REPEATABLE READ snapshot as the trial balance and the held totals. It records nothing in `reconciliation_runs`, so the console can poll it every second without filling the history. A corrupted balance in one sandbox shows up there and nowhere else, and the global worker still checks everything.
+- **Scoped checks.** `GET /invariants` runs the reconciliation checks for one sandbox, in the same REPEATABLE READ snapshot as the trial balance and the held totals. It records nothing in `reconciliation_runs`, so the console can poll it every second without filling the history. A corrupted balance in one sandbox shows up there and nowhere else. The global worker checks every sandbox except those under a chaos experiment (below).
 - **Keys with multiple transfers** is reported as zero because the `transfers` table has a unique key. It shows the guarantee; it doesn't measure it.
 
 The invariants panel polls that endpoint. Every break-it scenario creates its own accounts, so it can't disturb another visitor's numbers.
 
-**Cost.** Each poll runs the scoped checks, which scan the sandbox's entries. That is cheap for one visitor. It is the reason the demo will need caps on sandbox size before it's opened to more traffic.
+**Limits.** A sandbox holds at most 100 accounts and 1,000 transfers (`ledger.DefaultSandboxLimits`). Over the limit, a write gets 429 `sandbox_limit` and nothing is recorded, so the key stays free. A retry of a key that's already recorded still replays. The caps bound both storage and the cost of each poll, which scans the sandbox's entries. "Reset my sandbox" archives the old sandbox and moves the console to a new id. Entries are append-only, so nothing is deleted.
+
+Writes are also limited per client IP (`internal/ratelimit`, a token bucket in memory), with `WRITE_RATE_PER_IP` on the demo. Reads aren't limited, so the panel's polling doesn't count. The burst is sized from a measurement: running all six scenarios back to back makes about 70 writes, 45 of them from the retry storm and its 409 retries. A burst of 60 cut the suite off at the fifth scenario, so the demo uses 150 at 5 per second. The limiter keys on the TCP peer unless `RATE_LIMIT_PROXY_HOPS` says how many proxies sit in front. Entries further left in `X-Forwarded-For` are written by the client and are never trusted.
+
+### Fault injection (chaos build)
+
+The demo can wipe its cache, crash mid-request and corrupt a balance, but production code shouldn't be able to. The endpoints live in `internal/chaos` behind the `chaos` build tag. A default build compiles no-op stubs, and CI checks the default binary for the route strings. Every endpoint needs a sandbox and touches only that sandbox.
+
+- **`POST /chaos/flush-redis`** deletes `idem:{sandbox}:*` with SCAN and DEL, never `FLUSHALL`. It's what a Redis restart does to that sandbox.
+- **`X-Chaos-Crash: after-commit`** on `POST /transfers` runs the request normally, so the transfer commits. Then it discards the response and aborts the connection (`http.ErrAbortHandler`). It also marks the request with `idempotency.Abandon`, so the middleware leaves the claim in progress, which is what a crashed process leaves behind. Retries get 409 until the claim's 30-second TTL runs out, then the Postgres backstop replays the transfer. The console deletes the claim instead of waiting.
+- **`POST /chaos/corrupt-balance`** adds a delta to one cached balance with raw SQL. In the same transaction it sets the sandbox's `chaos_active`, which the global reconciliation worker skips (`recon.GlobalScope`). The sandbox's own checks see the drift, but the real `ledger_reconciliation_mismatches` gauge and its alert don't. Verified end to end: during a corruption the global worker kept reporting clean runs.
+- **`POST /chaos/repair`** calls `recon.Repair` and clears the flag. Repair isn't demo logic: it's the general fix for an account finding. It locks the scope's accounts in id order, the same order postings use, then rebuilds `balance` and `lock_version` from the entries in one statement. For a hot account it subtracts the pending rows, so cached plus pending equals the entries again.
 
 ## Observability
 

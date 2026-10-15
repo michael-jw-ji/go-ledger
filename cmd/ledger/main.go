@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,12 +25,14 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/michael-jw-ji/go-ledger/internal/chaos"
 	"github.com/michael-jw-ji/go-ledger/internal/httpapi"
 	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
 	"github.com/michael-jw-ji/go-ledger/internal/invariants"
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
 	"github.com/michael-jw-ji/go-ledger/internal/metrics"
 	"github.com/michael-jw-ji/go-ledger/internal/outbox"
+	"github.com/michael-jw-ji/go-ledger/internal/ratelimit"
 	"github.com/michael-jw-ji/go-ledger/internal/recon"
 	"github.com/michael-jw-ji/go-ledger/internal/rollup"
 	"github.com/michael-jw-ji/go-ledger/internal/sandbox"
@@ -143,6 +146,21 @@ func serve(log *slog.Logger) error {
 	mux.Handle("GET /metrics", m.Handler())
 	mux.HandleFunc("GET /reconciliation", latestRecon(pool, log))
 	mux.HandleFunc("GET /invariants", invariants.Handler(pool, log))
+	chaos.Register(mux, chaos.Deps{Pool: pool, Redis: rdb, Log: log})
+	if chaos.Enabled {
+		log.Warn("chaos endpoints enabled: this binary was built with -tags chaos")
+	}
+
+	// The crash middleware sits inside the sandbox scope, which it requires,
+	// and the rate limit outside everything, so refused writes cost nothing.
+	api := sandbox.Middleware(chaos.Wrap(m.Instrument(mux)))
+	limit, err := writeLimiter()
+	if err != nil {
+		return err
+	}
+	if limit != nil {
+		api = limit.Middleware(api)
+	}
 
 	var workers sync.WaitGroup
 	reconWorker := &recon.Worker{Pool: pool, Interval: reconInterval, Log: log, OnResult: m.OnRecon}
@@ -159,7 +177,7 @@ func serve(log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              listenAddr(),
-		Handler:           withConsole(sandbox.Middleware(m.Instrument(mux)), os.Getenv("WEB_DIR")),
+		Handler:           withConsole(api, os.Getenv("WEB_DIR")),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -205,6 +223,29 @@ func latestRecon(pool *pgxpool.Pool, log *slog.Logger) http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(res)
 		}
 	}
+}
+
+// writeLimiter builds the per-IP write limit from WRITE_RATE_PER_IP (writes
+// per second; unset or 0 turns it off, as for local runs and load tests),
+// WRITE_BURST_PER_IP (default 150) and RATE_LIMIT_PROXY_HOPS (how many proxies
+// add X-Forwarded-For entries in front of the server; default 0).
+func writeLimiter() (*ratelimit.Limiter, error) {
+	rate, err := strconv.ParseFloat(env("WRITE_RATE_PER_IP", "0"), 64)
+	if err != nil {
+		return nil, fmt.Errorf("WRITE_RATE_PER_IP: %w", err)
+	}
+	if rate <= 0 {
+		return nil, nil
+	}
+	burst, err := strconv.Atoi(env("WRITE_BURST_PER_IP", "150"))
+	if err != nil {
+		return nil, fmt.Errorf("WRITE_BURST_PER_IP: %w", err)
+	}
+	hops, err := strconv.Atoi(env("RATE_LIMIT_PROXY_HOPS", "0"))
+	if err != nil {
+		return nil, fmt.Errorf("RATE_LIMIT_PROXY_HOPS: %w", err)
+	}
+	return ratelimit.New(rate, burst, hops), nil
 }
 
 // listenAddr is ADDR, else :$PORT (set by hosts like Render), else :8088.

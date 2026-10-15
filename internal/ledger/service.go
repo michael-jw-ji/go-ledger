@@ -21,9 +21,22 @@ import (
 
 // Service is the ledger's write and read API over Postgres.
 type Service struct {
-	pool  *pgxpool.Pool
-	hooks Hooks
+	pool   *pgxpool.Pool
+	hooks  Hooks
+	limits SandboxLimits
 }
+
+// SandboxLimits cap what one sandbox may create, so a public demo can't be
+// used to fill the database. Unscoped requests have no limits. Zero means
+// unlimited.
+type SandboxLimits struct {
+	Accounts  int
+	Transfers int
+}
+
+// DefaultSandboxLimits leave room for many break-it runs (each creates two or
+// three accounts and a few transfers) before a visitor needs to reset.
+var DefaultSandboxLimits = SandboxLimits{Accounts: 100, Transfers: 1000}
 
 // Hooks let a caller observe the service without the ledger package
 // depending on a metrics library. Any hook may be nil.
@@ -38,12 +51,21 @@ type Hooks struct {
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool}
+	return &Service{pool: pool, limits: DefaultSandboxLimits}
 }
 
 // WithHooks returns a copy of the service that reports to h.
 func (s *Service) WithHooks(h Hooks) *Service {
-	return &Service{pool: s.pool, hooks: h}
+	c := *s
+	c.hooks = h
+	return &c
+}
+
+// WithSandboxLimits returns a copy of the service with different limits.
+func (s *Service) WithSandboxLimits(l SandboxLimits) *Service {
+	c := *s
+	c.limits = l
+	return &c
 }
 
 // selectAccounts reads effective balances: the cached balance plus any hot
@@ -94,6 +116,17 @@ func (s *Service) CreateAccount(ctx context.Context, in NewAccount) (Account, er
 		if _, err := s.pool.Exec(ctx, `INSERT INTO sandboxes (id) VALUES ($1) ON CONFLICT DO NOTHING`, sb); err != nil {
 			return Account{}, err
 		}
+		// A soft cap: two concurrent creates can both pass the count. That's
+		// fine for its purpose, which is bounding storage, not exactness.
+		if limit := s.limits.Accounts; limit > 0 {
+			var n int
+			if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts WHERE sandbox_id = $1`, sb).Scan(&n); err != nil {
+				return Account{}, err
+			}
+			if n >= limit {
+				return Account{}, fmt.Errorf("%w: at most %d accounts per sandbox", ErrSandboxLimit, limit)
+			}
+		}
 	}
 	return scanAccount(s.pool.QueryRow(ctx, `
 		INSERT INTO accounts (name, currency, normal_balance, allow_negative, hot, sandbox_id)
@@ -119,6 +152,21 @@ func (s *Service) ListAccounts(ctx context.Context) ([]Account, error) {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Account, error) { return scanAccount(r) })
+}
+
+// ArchiveSandbox records that the visitor reset the request's sandbox. Entries
+// are append-only, so nothing is deleted: the console moves to a fresh
+// sandbox id, and the archived one is left for cleanup. A sandbox left
+// corrupted by a chaos experiment stays excluded from global reconciliation.
+func (s *Service) ArchiveSandbox(ctx context.Context) error {
+	sb := sandbox.ID(ctx)
+	if sb == "" {
+		return invalid("the %s header is required", sandbox.Header)
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO sandboxes (id, archived_at) VALUES ($1, now())
+		ON CONFLICT (id) DO UPDATE SET archived_at = COALESCE(sandboxes.archived_at, now())`, sb)
+	return err
 }
 
 // CreateTransfer posts a balanced set of entries atomically.
@@ -188,6 +236,8 @@ func (s *Service) post(ctx context.Context, key string, hash []byte, legs []Leg,
 		switch {
 		case errors.Is(err, ErrAlreadyReversed), errors.Is(err, ErrIdempotencyMismatch):
 			outcome = "conflict"
+		case errors.Is(err, ErrSandboxLimit):
+			outcome = "limited"
 		case err != nil:
 			outcome = "error"
 		case t.Replayed:
@@ -221,6 +271,18 @@ func (s *Service) postTx(ctx context.Context, key string, hash []byte, legs []Le
 		return Transfer{}, ErrAlreadyReversed
 	case err != nil:
 		return Transfer{}, err
+	}
+	// Checked after the insert, so a replay of an existing key (handled
+	// above) still works at the limit. Over the limit, the transaction rolls
+	// back and the key stays free.
+	if sb := sandbox.ID(ctx); sb != "" && s.limits.Transfers > 0 {
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM transfers WHERE sandbox_id = $1`, sb).Scan(&n); err != nil {
+			return Transfer{}, err
+		}
+		if n > s.limits.Transfers {
+			return Transfer{}, fmt.Errorf("%w: at most %d transfers per sandbox", ErrSandboxLimit, s.limits.Transfers)
+		}
 	}
 
 	sp, err := tx.Begin(ctx) // SAVEPOINT

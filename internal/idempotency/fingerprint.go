@@ -47,3 +47,18 @@ func MarkRecorded(ctx context.Context) {
 		f.Store(true)
 	}
 }
+
+type abandonKey struct{}
+
+// Abandon marks a request whose response will never reach the client, the
+// way a server that crashes after committing loses it. The middleware then
+// leaves the claim in progress instead of caching or releasing it, exactly
+// what a crash would leave behind. Only the chaos build uses it.
+func Abandon(ctx context.Context) context.Context {
+	return context.WithValue(ctx, abandonKey{}, true)
+}
+
+func abandoned(ctx context.Context) bool {
+	v, _ := ctx.Value(abandonKey{}).(bool)
+	return v
+}

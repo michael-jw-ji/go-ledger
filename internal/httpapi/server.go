@@ -16,6 +16,7 @@ import (
 
 	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
+	"github.com/michael-jw-ji/go-ledger/internal/sandbox"
 )
 
 const (
@@ -51,6 +52,7 @@ func New(svc *ledger.Service, log *slog.Logger, idem *idempotency.Middleware) *h
 	mux.Handle("POST /transfers", keyed(s.createTransfer))
 	mux.HandleFunc("GET /transfers/{id}", s.getTransfer)
 	mux.Handle("POST /transfers/{id}/reverse", keyed(s.reverseTransfer))
+	mux.HandleFunc("POST /sandbox/reset", s.resetSandbox)
 	return mux
 }
 
@@ -118,6 +120,20 @@ func (s *Server) listEntries(w http.ResponseWriter, r *http.Request) {
 		resp["next_cursor"] = encodeCursor(next)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// resetSandbox archives the caller's sandbox. The client then switches to a
+// new sandbox id; nothing is deleted.
+func (s *Server) resetSandbox(w http.ResponseWriter, r *http.Request) {
+	if sandbox.ID(r.Context()) == "" {
+		writeError(w, http.StatusBadRequest, "missing_sandbox", "the "+sandbox.Header+" header is required")
+		return
+	}
+	if err := s.svc.ArchiveSandbox(r.Context()); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // transferBody accepts either explicit entries or the two-leg shorthand.
@@ -235,6 +251,8 @@ func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusConflict, "already_reversed", err.Error())
 	case errors.Is(err, ledger.ErrNotReversible):
 		writeError(w, http.StatusUnprocessableEntity, "not_reversible", err.Error())
+	case errors.Is(err, ledger.ErrSandboxLimit):
+		writeError(w, http.StatusTooManyRequests, "sandbox_limit", err.Error())
 	default:
 		s.log.ErrorContext(r.Context(), "request failed", "method", r.Method, "path", r.URL.Path, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")

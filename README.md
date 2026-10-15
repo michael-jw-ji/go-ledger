@@ -23,7 +23,15 @@ The [live demo](https://go-ledger.onrender.com) opens on a **Break It** tab. Eac
 - **Double spend:** two payments race to drain a wallet that holds $100. One posts, one is declined, and the balance never goes negative.
 - **Key reuse:** a key reused for a different amount is refused with `idempotency_key_reused`. The original request, reformatted, replays the first transfer.
 
-The invariants panel above the tabs (trial balance, held money, reconciliation, duplicate posts) polls the sandbox every second. [DESIGN.md](DESIGN.md#sandboxes-and-the-live-console) covers how sandboxes are isolated.
+Three more inject faults, using endpoints that only exist in a binary built with `-tags chaos` (the demo is one):
+
+- **Redis wiped:** after a transfer posts, the sandbox's idempotency cache is deleted and the key is retried. Postgres replays the original transfer.
+- **Crash after commit:** the server commits, then drops the connection without answering. The retry gets 409 while the dead request's claim lives, then the original transfer, never a second one.
+- **Corrupt a balance:** one cached balance is edited with raw SQL. The sandbox's reconciliation names that account and the size of the drift, and a repair rebuilds the balance from its entries. The real reconciliation alert stays quiet, because the global worker skips sandboxes under a chaos experiment.
+
+The invariants panel above the tabs (trial balance, held money, reconciliation, duplicate posts) polls the sandbox every second, and turns red while a balance is corrupted. [DESIGN.md](DESIGN.md#sandboxes-and-the-live-console) covers how sandboxes are isolated and limited.
+
+![Break It tab: all six scenarios passed, invariants clean](docs/images/break-it.png)
 
 ## Results
 
@@ -89,13 +97,15 @@ To run the same image locally: `docker build -t go-ledger . && docker run -p 808
 | `make run` | Run the API on `:8088` |
 | `make test` | Unit tests |
 | `make test-integration` | Testcontainers suite against real Postgres and Redis (needs Docker). `LEDGER_PROP_ITERS=10000` scales the property test. |
-| `make lint` | `go vet` and golangci-lint (via Docker) |
+| `make test-chaos` | The integration suite plus the fault-injection tests (`-tags integration,chaos`). CI runs this. |
+| `make run-chaos` | The API with the fault-injection endpoints compiled in |
+| `make lint` | `go vet` and golangci-lint (via Docker), for the default and the chaos build |
 | `make recon` | One-off reconciliation; exits 1 on mismatches |
 | `make obs` | Prometheus on `:9090` and Grafana on `:3000`, scraping `make run` |
 | `make load-steady` / `make load-hot` | k6 via Docker. Override with `RATE=500 DURATION=2m`; `HOT=false` gives the hot test an ordinary merchant. |
 | `make web` / `make web-test` | Test console dev server / Vitest suite |
 
-The API reads `DATABASE_URL`, `REDIS_URL`, `ADDR`, `RECON_INTERVAL` (default `60s`), `ROLLUP_INTERVAL` (default `100ms`), `OUTBOX_INTERVAL` (default `200ms`) and `OUTBOX_STREAM` (default `ledger.events`).
+The API reads `DATABASE_URL`, `REDIS_URL`, `ADDR`, `RECON_INTERVAL` (default `60s`), `ROLLUP_INTERVAL` (default `100ms`), `OUTBOX_INTERVAL` (default `200ms`) and `OUTBOX_STREAM` (default `ledger.events`). For a public deployment, `WRITE_RATE_PER_IP` turns on a per-IP write limit (writes per second; off by default), with `WRITE_BURST_PER_IP` (default `150`) and `RATE_LIMIT_PROXY_HOPS` (how many proxies add `X-Forwarded-For` entries; default `0`, which uses the TCP peer).
 
 Events go to the Redis stream `ledger.events`, one message per posted transfer or reversal, with fields `event_id`, `type`, `aggregate_id`, `created_at` and `payload` (the transfer as JSON). Delivery is at least once, so dedupe on `event_id`. To watch it: `docker compose exec redis redis-cli XREAD BLOCK 0 STREAMS ledger.events $`.
 
@@ -111,6 +121,8 @@ Events go to the Redis stream `ledger.events`, one message per posted transfer o
 | `POST` | `/transfers/{id}/reverse` | `Idempotency-Key` header required. At most one successful reversal per transfer. |
 | `GET` | `/reconciliation` | Latest reconciliation run |
 | `GET` | `/invariants` | Trial balance, held money and a scoped reconciliation for the sandbox in `X-Sandbox-Id`. Records nothing. |
+| `POST` | `/sandbox/reset` | Archives the sandbox in `X-Sandbox-Id`; the client then uses a new id |
+| `GET`, `POST` | `/chaos`, `/chaos/flush-redis`, `/chaos/corrupt-balance`, `/chaos/repair` | Chaos build only, scoped to the sandbox. `X-Chaos-Crash: after-commit` on `POST /transfers` drops the response after commit. |
 | `GET` | `/metrics` | Prometheus |
 | `GET` | `/healthz` | |
 

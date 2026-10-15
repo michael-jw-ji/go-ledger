@@ -3,9 +3,14 @@ import type { Call, CallOptions, Io, Scenario } from './common'
 import { retryStorm } from './retryStorm'
 import { doubleSpend } from './doubleSpend'
 import { keyReuse } from './keyReuse'
+import { redisWiped } from './redisWiped'
+import { crashAfterCommit } from './crashAfterCommit'
+import { corruptBalance } from './corruptBalance'
 
-// A small in-memory ledger that answers the API routes the scenarios use.
-// The flags break one guarantee each, so the fail paths can be exercised.
+// A small in-memory ledger that answers the API routes the scenarios use,
+// with the two idempotency layers kept apart: `redis` (a cache that chaos can
+// wipe) and `transfers` (the Postgres record). Each flag breaks one
+// guarantee, so every scenario's fail path can be exercised.
 interface Flags {
   /** false: every POST posts, as if idempotency were gone. */
   dedupe?: boolean
@@ -13,17 +18,22 @@ interface Flags {
   overdraft?: boolean
   /** false: a reused key replays instead of answering 422. */
   keyCheck?: boolean
+  /** false: only Redis remembers keys; wiping it lets a retry post again. */
+  backstop?: boolean
+  /** false: repair leaves the corruption in place. */
+  repairs?: boolean
 }
 
 class FakeLedger {
-  private accounts = new Map<number, { balance: number; allowNegative: boolean }>()
-  private transfers = new Map<string, { hash: string; id: string; body: unknown }>()
+  private accounts = new Map<number, { balance: number; drift: number; allowNegative: boolean }>()
+  private transfers = new Map<string, { hash: string; body: unknown }>()
+  private redis = new Map<string, 'in_progress' | 'done'>()
   private nextAccount = 1
   private nextTransfer = 1
   private flags: Required<Flags>
 
   constructor(flags: Flags = {}) {
-    this.flags = { dedupe: true, overdraft: false, keyCheck: true, ...flags }
+    this.flags = { dedupe: true, overdraft: false, keyCheck: true, backstop: true, repairs: true, ...flags }
   }
 
   readonly io: Io = {
@@ -32,40 +42,60 @@ class FakeLedger {
   }
 
   private handle(method: string, path: string, opts: CallOptions): Call {
-    if (method === 'POST' && path === '/accounts') {
+    const route = `${method} ${path}`
+    if (route === 'POST /accounts') {
       const b = opts.body as { allow_negative: boolean }
       const id = this.nextAccount++
-      this.accounts.set(id, { balance: 0, allowNegative: b.allow_negative })
+      this.accounts.set(id, { balance: 0, drift: 0, allowNegative: b.allow_negative })
       return ok(201, { id })
     }
     if (method === 'GET' && path.startsWith('/accounts/')) {
-      const acct = this.accounts.get(Number(path.split('/')[2]))
-      return acct ? ok(200, { balance: acct.balance }) : ok(404, { error: { code: 'not_found' } })
+      const a = this.accounts.get(Number(path.split('/')[2]))
+      return a ? ok(200, { balance: a.balance + a.drift }) : ok(404, { error: { code: 'not_found' } })
     }
-    if (method === 'POST' && path === '/transfers') return this.post(opts)
-    if (method === 'GET' && path === '/invariants') {
-      const total = [...this.accounts.values()].reduce((s, a) => s + a.balance, 0)
+    if (route === 'POST /transfers') return this.post(opts)
+    if (route === 'GET /invariants') {
+      const mismatches = [...this.accounts]
+        .filter(([, a]) => a.drift !== 0)
+        .map(([id, a]) => ({ kind: 'account', account_id: id, cached: a.balance + a.drift, computed: a.balance }))
       return ok(200, {
         trial_balance: [{ currency: 'USD', difference: 0 }],
         keys_with_multiple_transfers: 0,
-        recon: { mismatches: [], accounts_checked: this.accounts.size, finished_at: '' },
-        held: [{ currency: 'USD', amount: total }],
-        accounts: this.accounts.size,
+        recon: { mismatches, accounts_checked: this.accounts.size, finished_at: '' },
       })
     }
-    throw new Error(`unexpected ${method} ${path}`)
+    if (route === 'GET /chaos') return ok(200, { enabled: true })
+    if (route === 'POST /chaos/flush-redis') {
+      const deleted = this.redis.size
+      this.redis.clear()
+      return ok(200, { deleted })
+    }
+    if (route === 'POST /chaos/corrupt-balance') {
+      const b = opts.body as { account_id: number; delta: number }
+      this.accounts.get(b.account_id)!.drift += b.delta
+      return ok(200, b)
+    }
+    if (route === 'POST /chaos/repair') {
+      if (this.flags.repairs) for (const a of this.accounts.values()) a.drift = 0
+      return ok(200, { repaired: [] })
+    }
+    throw new Error(`unexpected ${route}`)
   }
 
   private post(opts: CallOptions): Call {
     const raw = opts.raw ?? JSON.stringify(opts.body)
     const hash = JSON.stringify(JSON.parse(raw))
     const key = opts.key ?? ''
-    const seen = this.transfers.get(key)
-    if (seen && this.flags.dedupe) {
-      if (seen.hash !== hash && this.flags.keyCheck) {
-        return ok(422, { error: { code: 'idempotency_key_reused' } })
+
+    if (this.flags.dedupe) {
+      const claim = this.redis.get(key)
+      if (claim === 'in_progress') return ok(409, { error: { code: 'request_in_progress' } })
+      const seen = this.transfers.get(key)
+      if (seen && (claim === 'done' || this.flags.backstop)) {
+        if (seen.hash !== hash && this.flags.keyCheck) return ok(422, { error: { code: 'idempotency_key_reused' } })
+        this.redis.set(key, 'done')
+        return { ...ok(201, seen.body), replayed: true }
       }
-      return { ...ok(201, seen.body), replayed: true }
     }
 
     const b = JSON.parse(raw) as { debit_account_id: number; credit_account_id: number; amount: number }
@@ -77,7 +107,13 @@ class FakeLedger {
     debit.balance -= b.amount
     credit.balance += b.amount
     const body = { id: `t-${this.nextTransfer++}`, status: 'posted' }
-    this.transfers.set(key, { hash, id: body.id, body })
+    this.transfers.set(key, { hash, body })
+
+    if (opts.headers?.['X-Chaos-Crash'] === 'after-commit') {
+      this.redis.set(key, 'in_progress') // the dead server's claim
+      return { status: 0, replayed: false, code: 'network_error', body: null }
+    }
+    this.redis.set(key, 'done')
     return ok(201, body)
   }
 }
@@ -129,5 +165,47 @@ describe('Key reuse', () => {
   it('fails when a reused key silently replays a different request', async () => {
     const r = await run(keyReuse, { keyCheck: false })
     expect(r.pass).toBe(false)
+  })
+})
+
+describe('Redis wiped', () => {
+  it('passes when Postgres replays the transfer after the cache is gone', async () => {
+    const r = await run(redisWiped)
+    expect(r.pass).toBe(true)
+    expect(r.actual).toContain('201 replayed')
+  })
+
+  it('fails when only Redis remembered the key', async () => {
+    const r = await run(redisWiped, { backstop: false })
+    expect(r.pass).toBe(false)
+    expect(r.actual).toContain('different transfer id')
+  })
+})
+
+describe('Crash after commit', () => {
+  it('passes with no answer, then 409, then a replay of the committed transfer', async () => {
+    const r = await run(crashAfterCommit)
+    expect(r.pass).toBe(true)
+    expect(r.actual).toMatch(/^no answer, then 409 request_in_progress, then 201 replayed/)
+  })
+
+  it('fails when the retry after the claim posts a second time', async () => {
+    const r = await run(crashAfterCommit, { backstop: false })
+    expect(r.pass).toBe(false)
+    expect(r.actual).toContain('$80.00')
+  })
+})
+
+describe('Corrupt a balance', () => {
+  it('passes when reconciliation names the account and repair clears it', async () => {
+    const r = await run(corruptBalance)
+    expect(r.pass).toBe(true)
+    expect(r.actual).toMatch(/^1 finding\(s\): account #\d+ off by \$7\.00; clean after repair/)
+  })
+
+  it('fails when the repair leaves the drift', async () => {
+    const r = await run(corruptBalance, { repairs: false })
+    expect(r.pass).toBe(false)
+    expect(r.actual).toContain('1 left after repair')
   })
 })

@@ -104,6 +104,12 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		rec := &recorder{header: http.Header{}, status: http.StatusOK}
 		next.ServeHTTP(rec, r.WithContext(context.WithValue(ctx, recordedKey{}, &recorded)))
 
+		if abandoned(ctx) && recorded.Load() {
+			// A simulated crash after commit: leave the claim in progress.
+			// It expires after its TTL, and retries then reach Postgres.
+			return
+		}
+
 		// Finish even if the client hung up: the transfer may have committed.
 		storeCtx := context.WithoutCancel(ctx)
 		if recorded.Load() && rec.status < 500 {

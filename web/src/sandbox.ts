@@ -19,6 +19,10 @@ export function sandboxId(): string {
   } catch {
     // Storage is unavailable (private window, blocked site data). Fall through.
   }
+  return replace()
+}
+
+function replace(): string {
   memo = crypto.randomUUID()
   try {
     localStorage.setItem(STORAGE_KEY, memo)
@@ -26,4 +30,17 @@ export function sandboxId(): string {
     // Keep the in-memory id.
   }
   return memo
+}
+
+/** Archives the current sandbox on the server and switches to a new one.
+ *  Entries are append-only, so the old sandbox isn't deleted; this page just
+ *  stops using it. The switch happens even if the server call fails, since a
+ *  fresh id is all the visitor needs. */
+export async function resetSandbox(): Promise<string> {
+  try {
+    await fetch('/api/sandbox/reset', { method: 'POST', headers: { 'X-Sandbox-Id': sandboxId() } })
+  } catch {
+    // Offline: still move on to a fresh sandbox.
+  }
+  return replace()
 }

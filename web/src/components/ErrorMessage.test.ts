@@ -8,6 +8,7 @@ const API_CODES = [
   'unbalanced', 'validation_error', 'malformed_json', 'missing_idempotency_key', 'body_too_large',
   'invalid_limit', 'invalid_cursor', 'idempotency_key_reused', 'request_in_progress',
   'already_reversed', 'not_reversible', 'not_found', 'internal',
+  'sandbox_limit', 'rate_limited', 'invalid_sandbox', 'missing_sandbox',
 ]
 
 describe('describeError', () => {

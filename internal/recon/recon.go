@@ -59,20 +59,33 @@ type Result struct {
 type Scope struct {
 	All     bool
 	Sandbox string
+	// ExcludeChaos skips sandboxes a chaos endpoint has deliberately
+	// corrupted, so a visitor's experiment can't fire the real alert.
+	ExcludeChaos bool
 }
 
-// AllScope checks the whole ledger.
-var AllScope = Scope{All: true}
+var (
+	// AllScope checks the whole ledger, chaos sandboxes included.
+	AllScope = Scope{All: true}
+	// GlobalScope is what the reconciliation worker checks.
+	GlobalScope = Scope{All: true, ExcludeChaos: true}
+)
 
-// args are the two parameters every check query takes: $1 is All, $2 is the
-// sandbox (NULL when unscoped). A check filters with
-// ($1 OR x.sandbox_id IS NOT DISTINCT FROM $2::text).
+// Args are the parameters of every query that uses Filter.
 func (s Scope) Args() []any {
 	var sb any
 	if s.Sandbox != "" {
 		sb = s.Sandbox
 	}
-	return []any{s.All, sb}
+	return []any{s.All, sb, s.ExcludeChaos}
+}
+
+// Filter is the SQL condition keeping rows whose sandbox column col is in
+// scope. EXISTS, not IN, so unscoped rows (NULL col) are never dropped by
+// the chaos exclusion.
+func (s Scope) Filter(col string) string {
+	return "($1 OR " + col + " IS NOT DISTINCT FROM $2::text)" +
+		" AND NOT ($3 AND EXISTS (SELECT 1 FROM sandboxes sb WHERE sb.id = " + col + " AND sb.chaos_active))"
 }
 
 // Count returns the number of findings of one kind.
@@ -114,7 +127,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool) (Result, error) {
 		return res, nil
 	}
 
-	if err := check(ctx, tx, AllScope, &res); err != nil {
+	if err := check(ctx, tx, GlobalScope, &res); err != nil {
 		return res, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -180,16 +193,16 @@ func checkAccounts(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) err
 		LEFT JOIN (
 		    SELECT e.account_id, SUM(`+signed+`) AS total, COUNT(*) AS n
 		    FROM entries e JOIN accounts a ON a.id = e.account_id
-		    WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		    WHERE `+scope.Filter("a.sandbox_id")+`
 		    GROUP BY e.account_id
 		) s ON s.account_id = a.id
 		LEFT JOIN (
 		    SELECT p.account_id, SUM(p.signed_amount) AS total, COUNT(*) AS n
 		    FROM hot_pending p JOIN accounts a ON a.id = p.account_id
-		    WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		    WHERE `+scope.Filter("a.sandbox_id")+`
 		    GROUP BY p.account_id
 		) p ON p.account_id = a.id
-		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		WHERE `+scope.Filter("a.sandbox_id")+`
 		ORDER BY a.id`, scope.Args()...)
 	if err != nil {
 		return err
@@ -215,7 +228,7 @@ func checkTransfers(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) er
 		       SUM(e.amount) FILTER (WHERE e.direction = 'debit'),
 		       SUM(e.amount) FILTER (WHERE e.direction = 'credit')
 		FROM entries e JOIN transfers t ON t.id = e.transfer_id
-		WHERE ($1 OR t.sandbox_id IS NOT DISTINCT FROM $2::text)
+		WHERE `+scope.Filter("t.sandbox_id")+`
 		GROUP BY e.transfer_id
 		HAVING SUM(CASE WHEN e.direction = 'debit' THEN e.amount ELSE -e.amount END) <> 0`, scope.Args()...)
 	if err != nil {
@@ -241,7 +254,7 @@ func checkTrialBalance(ctx context.Context, tx pgx.Tx, scope Scope, res *Result)
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'debit'), 0),
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'credit'), 0)
 		FROM entries e JOIN accounts a ON a.id = e.account_id
-		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		WHERE `+scope.Filter("a.sandbox_id")+`
 		GROUP BY a.currency
 		ORDER BY a.currency`, scope.Args()...)
 	if err != nil {
@@ -270,7 +283,7 @@ func checkPending(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) erro
 		FROM hot_pending p
 		JOIN entries e ON e.id = p.entry_id
 		JOIN accounts a ON a.id = e.account_id
-		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		WHERE `+scope.Filter("a.sandbox_id")+`
 		  AND (p.account_id <> e.account_id OR p.signed_amount <> `+signed+`)`, scope.Args()...)
 	if err != nil {
 		return err
@@ -284,6 +297,52 @@ func checkPending(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) erro
 		res.Mismatches = append(res.Mismatches, m)
 	}
 	return rows.Err()
+}
+
+// Repair rebuilds the cached balance and lock_version of every account in
+// scope from its entries, which are the source of truth, and returns the ids
+// it changed. It is the fix for an account finding.
+//
+// It locks the accounts first, in id order like a posting, so no locked-path
+// posting or rollup can change them mid-repair. Hot credits skip that lock,
+// but each adds an entry and a hot_pending row in one transaction, and the
+// single UPDATE below sees both or neither.
+func Repair(ctx context.Context, pool *pgxpool.Pool, scope Scope) ([]int64, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
+
+	if _, err := tx.Exec(ctx, `
+		SELECT a.id FROM accounts a WHERE `+scope.Filter("a.sandbox_id")+`
+		ORDER BY a.id FOR NO KEY UPDATE`, scope.Args()...); err != nil {
+		return nil, fmt.Errorf("lock accounts: %w", err)
+	}
+	rows, err := tx.Query(ctx, `
+		UPDATE accounts a
+		SET balance = s.total - COALESCE(p.total, 0), lock_version = s.n - COALESCE(p.n, 0)
+		FROM (
+		    SELECT a.id, COALESCE(SUM(`+signed+`), 0) AS total, COUNT(e.id) AS n
+		    FROM accounts a LEFT JOIN entries e ON e.account_id = a.id
+		    WHERE `+scope.Filter("a.sandbox_id")+`
+		    GROUP BY a.id
+		) s
+		LEFT JOIN (
+		    SELECT account_id, SUM(signed_amount) AS total, COUNT(*) AS n
+		    FROM hot_pending GROUP BY account_id
+		) p ON p.account_id = s.id
+		WHERE a.id = s.id
+		  AND (a.balance, a.lock_version) IS DISTINCT FROM (s.total - COALESCE(p.total, 0), s.n - COALESCE(p.n, 0))
+		RETURNING a.id`, scope.Args()...)
+	if err != nil {
+		return nil, fmt.Errorf("repair: %w", err)
+	}
+	fixed, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, err
+	}
+	return fixed, tx.Commit(ctx)
 }
 
 func deref(p *int64) int64 {

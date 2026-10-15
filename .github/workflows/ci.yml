@@ -26,9 +26,15 @@ jobs:
         run: make lint
       - name: unit tests
         run: make test TESTFLAGS=-race
-      # Testcontainers starts Postgres and Redis on the runner's Docker.
+      # The default binary must not contain the fault-injection endpoints.
+      - name: default build has no chaos endpoints
+        run: |
+          go build -o /tmp/ledger ./cmd/ledger
+          if grep -q 'chaos/flush-redis' /tmp/ledger; then echo "chaos code in the default build"; exit 1; fi
+      # Testcontainers starts Postgres and Redis on the runner's Docker. The
+      # chaos tag adds the fault-injection tests to the full suite.
       - name: integration tests
-        run: make test-integration TESTFLAGS="-race -timeout=15m"
+        run: make test-chaos TESTFLAGS="-race -timeout=15m"
 
   web:
     runs-on: ubuntu-latest
@@ -53,3 +59,5 @@ jobs:
       - uses: actions/checkout@v5
       - name: build the deploy image
         run: docker build -t go-ledger:ci .
+      - name: build the demo image (chaos)
+        run: docker build --build-arg GO_TAGS=chaos -t go-ledger:ci-chaos .
