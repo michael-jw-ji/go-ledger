@@ -1,13 +1,15 @@
 import { useMemo, useState } from 'react'
-import { formatMoney } from './money'
 import { useRequestLog } from './log'
-import { useAccounts, useHealth, useReconciliation } from './queries'
+import { useAccounts, useHealth } from './queries'
 import { AccountsPanel } from './components/AccountsPanel'
+import { BreakIt } from './components/BreakIt'
+import { InvariantsPanel } from './components/InvariantsPanel'
 import { TransferForm } from './components/TransferForm'
 import { LedgerPanel } from './components/LedgerPanel'
 import { RequestLogPanel } from './components/RequestLogPanel'
+import './break-it.css'
 
-type Tab = 'accounts' | 'transfer' | 'ledger' | 'log'
+type Tab = 'break' | 'accounts' | 'transfer' | 'ledger' | 'log'
 
 const isLocal = ['localhost', '127.0.0.1'].includes(location.hostname)
 
@@ -16,9 +18,8 @@ export default function App() {
   const accountsQ = useAccounts()
   const accounts = useMemo(() => accountsQ.data ?? [], [accountsQ.data])
   const log = useRequestLog()
-  const recon = useReconciliation()
 
-  const [tab, setTab] = useState<Tab>('accounts')
+  const [tab, setTab] = useState<Tab>('break')
   const [accountId, setAccountId] = useState<number | null>(null)
   const [transferId, setTransferId] = useState<string | null>(null)
 
@@ -32,20 +33,10 @@ export default function App() {
     setTab('ledger')
   }
 
-  // Σ credit-normal − Σ debit-normal, per currency. Double-entry keeps it at 0.
-  const trial = useMemo(() => {
-    const byCur = new Map<string, number>()
-    for (const a of accounts) {
-      byCur.set(a.currency, (byCur.get(a.currency) ?? 0) + (a.normal_balance === 'credit' ? a.balance : -a.balance))
-    }
-    const off = [...byCur].filter(([, v]) => v !== 0)
-    return { ok: off.length === 0, off }
-  }, [accounts])
-
-  const replays = log.filter((e) => e.replayed).length
   const online = health.isSuccess
 
   const tabs: { id: Tab; label: string; count?: number }[] = [
+    { id: 'break', label: 'BREAK IT' },
     { id: 'accounts', label: 'ACCOUNTS', count: accounts.length },
     { id: 'transfer', label: 'TRANSFER' },
     { id: 'ledger', label: 'LEDGER' },
@@ -68,10 +59,10 @@ export default function App() {
       </header>
 
       <div className="tag">DOUBLE-ENTRY PAYMENTS LEDGER</div>
-      <h1 className="headline">Move money. Prove it moved exactly once.</h1>
+      <h1 className="headline">Try to break it. Watch it hold.</h1>
       <p className="sub">
-        A console for testing the Go ledger. Every write sends an <code>Idempotency-Key</code>. The request log shows
-        which requests posted, which were rejected, and which were replayed.
+        A ledger that moves money exactly once, even when requests are retried, race each other, or the cache is wiped.
+        Run the attacks below against the live API. The invariants stay on screen so you can see them hold.
       </p>
 
       {!online && !health.isPending && (
@@ -90,43 +81,7 @@ export default function App() {
         </div>
       )}
 
-      <section className="metrics" aria-label="Summary">
-        <div className="metric">
-          <div className="label">Accounts</div>
-          <div className="value">{accounts.length}</div>
-        </div>
-        <div className="metric">
-          <div className="label">Trial balance</div>
-          <div className={`value${trial.ok ? ' accent' : ''}`}>
-            {trial.ok ? formatMoney(0) : trial.off.map(([c, v]) => formatMoney(v, c)).join(' · ')}
-          </div>
-          <div className="hint">Σ CREDIT − Σ DEBIT {trial.ok ? '· BALANCED' : '· DRIFT!'}</div>
-        </div>
-        <div className="metric">
-          <div className="label">Reconciliation</div>
-          {recon.data ? (
-            <>
-              <div className={`value${recon.data.mismatches.length === 0 ? ' accent' : ''}`}>
-                {recon.data.mismatches.length === 0 ? 'CLEAN' : `${recon.data.mismatches.length} OFF`}
-              </div>
-              <div className="hint">
-                RUN #{recon.data.run_id} · {recon.data.accounts_checked} ACCOUNTS ·{' '}
-                {new Date(recon.data.finished_at).toLocaleTimeString()}
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="value">—</div>
-              <div className="hint">{recon.isPending ? 'LOADING' : 'NO RUN YET'}</div>
-            </>
-          )}
-        </div>
-        <div className="metric">
-          <div className="label">Replays served</div>
-          <div className="value">{replays}</div>
-          <div className="hint">DUPLICATES NOT POSTED</div>
-        </div>
-      </section>
+      <InvariantsPanel />
 
       <nav className="steps" role="tablist" aria-label="Sections">
         {tabs.map((t, i) => (
@@ -148,6 +103,7 @@ export default function App() {
       </nav>
 
       <main role="tabpanel">
+        {tab === 'break' && <BreakIt />}
         {tab === 'accounts' && <AccountsPanel accounts={accounts} selectedId={accountId} onSelect={openAccount} />}
         {tab === 'transfer' &&
           (accounts.length < 2 ? (

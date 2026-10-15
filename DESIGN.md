@@ -188,6 +188,19 @@ Those need external reconciliation against a bank or processor statement, which 
 
 **Cost.** Each run aggregates every entry, which is O(entries). That's fine at this scale. A large ledger would checkpoint per-account totals at a known entry boundary and reconcile only entries since then.
 
+## Sandboxes and the live console
+
+The public demo has no login, so every visitor gets a sandbox: a random UUID the console sends in `X-Sandbox-Id`. Accounts and transfers carry a `sandbox_id`, and requests see only their own sandbox. Rows with no sandbox are the unscoped data that curl, the tests and local development have always used, so requests without the header behave as before.
+
+- **Isolation.** A transfer that names an account from another sandbox is rejected as `account_not_found`, and recorded like any other rejection. Reads of another sandbox's account or transfer return 404.
+- **Idempotency keys.** The Postgres key becomes `sb:{sandbox}:{key}` and the Redis key `idem:{sandbox}:{METHOD path}:{key}`. Two visitors can use the same key without colliding.
+- **Scoped checks.** `GET /invariants` runs the reconciliation checks for one sandbox, in the same REPEATABLE READ snapshot as the trial balance and the held totals. It records nothing in `reconciliation_runs`, so the console can poll it every second without filling the history. A corrupted balance in one sandbox shows up there and nowhere else, and the global worker still checks everything.
+- **Keys with multiple transfers** is reported as zero because the `transfers` table has a unique key. It shows the guarantee; it doesn't measure it.
+
+The invariants panel polls that endpoint. Every break-it scenario creates its own accounts, so it can't disturb another visitor's numbers.
+
+**Cost.** Each poll runs the scoped checks, which scan the sandbox's entries. That is cheap for one visitor. It is the reason the demo will need caps on sandbox size before it's opened to more traffic.
+
 ## Observability
 
 `GET /metrics` exposes:

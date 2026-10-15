@@ -1,4 +1,5 @@
 import { addLog } from './log'
+import { sandboxId } from './sandbox'
 
 export type Side = 'debit' | 'credit'
 
@@ -68,6 +69,17 @@ export interface Reconciliation {
   mismatches: ReconMismatch[]
 }
 
+/** GET /invariants: the sandbox's figures, from one consistent snapshot. */
+export interface Invariants {
+  checked_at: string
+  accounts: number
+  trial_balance: { currency: string; debits: number; credits: number; difference: number }[]
+  held: { currency: string; amount: number }[]
+  recon: { accounts_checked: number; mismatches: ReconMismatch[]; finished_at: string }
+  /** Zero by construction: the transfers table has a unique key. */
+  keys_with_multiple_transfers: number
+}
+
 export interface ApiResult<T> {
   data: T
   status: number
@@ -101,7 +113,7 @@ async function request<T>(
   path: string,
   opts: { body?: unknown; key?: string; silent?: boolean } = {},
 ): Promise<ApiResult<T>> {
-  const headers: Record<string, string> = {}
+  const headers: Record<string, string> = { 'X-Sandbox-Id': sandboxId() }
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json'
   if (opts.key) headers['Idempotency-Key'] = opts.key
 
@@ -155,6 +167,7 @@ export const api = {
       'GET', `/accounts/${accountId}/entries?${q}`, { silent: true })
   },
   reconciliation: () => request<Reconciliation>('GET', '/reconciliation', { silent: true }),
+  invariants: () => request<Invariants>('GET', '/invariants', { silent: true }),
   getTransfer: (id: string) => request<Transfer>('GET', `/transfers/${id}`, { silent: true }),
   createTransfer: (body: TransferBody, key: string) =>
     request<Transfer>('POST', '/transfers', { body, key }),

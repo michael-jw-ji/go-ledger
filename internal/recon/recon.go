@@ -53,6 +53,28 @@ type Result struct {
 	Skipped bool `json:"skipped,omitempty"`
 }
 
+// Scope selects which accounts a check covers. All covers the whole ledger.
+// Otherwise the check covers one sandbox, where an empty Sandbox means the
+// unscoped rows (NULL sandbox_id).
+type Scope struct {
+	All     bool
+	Sandbox string
+}
+
+// AllScope checks the whole ledger.
+var AllScope = Scope{All: true}
+
+// args are the two parameters every check query takes: $1 is All, $2 is the
+// sandbox (NULL when unscoped). A check filters with
+// ($1 OR x.sandbox_id IS NOT DISTINCT FROM $2::text).
+func (s Scope) Args() []any {
+	var sb any
+	if s.Sandbox != "" {
+		sb = s.Sandbox
+	}
+	return []any{s.All, sb}
+}
+
 // Count returns the number of findings of one kind.
 func (r Result) Count(kind string) int {
 	n := 0
@@ -92,7 +114,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool) (Result, error) {
 		return res, nil
 	}
 
-	if err := check(ctx, tx, &res); err != nil {
+	if err := check(ctx, tx, AllScope, &res); err != nil {
 		return res, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -115,23 +137,30 @@ func Run(ctx context.Context, pool *pgxpool.Pool) (Result, error) {
 // Check runs every check inside tx without recording a run. Run is the
 // normal entry point; Check exists so tests can reconcile uncommitted state.
 func Check(ctx context.Context, tx pgx.Tx) (Result, error) {
+	return CheckScope(ctx, tx, AllScope)
+}
+
+// CheckScope is Check limited to one scope. The sandbox console uses it for
+// live invariants: it runs in the caller's snapshot and records nothing, so
+// polling it doesn't fill reconciliation_runs.
+func CheckScope(ctx context.Context, tx pgx.Tx, scope Scope) (Result, error) {
 	res := Result{StartedAt: time.Now().UTC(), Mismatches: []Mismatch{}}
-	err := check(ctx, tx, &res)
+	err := check(ctx, tx, scope, &res)
 	res.FinishedAt = time.Now().UTC()
 	return res, err
 }
 
-func check(ctx context.Context, tx pgx.Tx, res *Result) error {
-	if err := checkAccounts(ctx, tx, res); err != nil {
+func check(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) error {
+	if err := checkAccounts(ctx, tx, scope, res); err != nil {
 		return fmt.Errorf("check accounts: %w", err)
 	}
-	if err := checkTransfers(ctx, tx, res); err != nil {
+	if err := checkTransfers(ctx, tx, scope, res); err != nil {
 		return fmt.Errorf("check transfers: %w", err)
 	}
-	if err := checkTrialBalance(ctx, tx, res); err != nil {
+	if err := checkTrialBalance(ctx, tx, scope, res); err != nil {
 		return fmt.Errorf("check trial balance: %w", err)
 	}
-	if err := checkPending(ctx, tx, res); err != nil {
+	if err := checkPending(ctx, tx, scope, res); err != nil {
 		return fmt.Errorf("check pending: %w", err)
 	}
 	return nil
@@ -142,7 +171,7 @@ func check(ctx context.Context, tx pgx.Tx, res *Result) error {
 // accounts.balance plus the account's hot_pending rows.
 const signed = `CASE WHEN e.direction = a.normal_balance THEN e.amount ELSE -e.amount END`
 
-func checkAccounts(ctx context.Context, tx pgx.Tx, res *Result) error {
+func checkAccounts(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) error {
 	rows, err := tx.Query(ctx, `
 		SELECT a.id,
 		       a.balance + COALESCE(p.total, 0), a.lock_version + COALESCE(p.n, 0),
@@ -151,13 +180,17 @@ func checkAccounts(ctx context.Context, tx pgx.Tx, res *Result) error {
 		LEFT JOIN (
 		    SELECT e.account_id, SUM(`+signed+`) AS total, COUNT(*) AS n
 		    FROM entries e JOIN accounts a ON a.id = e.account_id
+		    WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
 		    GROUP BY e.account_id
 		) s ON s.account_id = a.id
 		LEFT JOIN (
-		    SELECT account_id, SUM(signed_amount) AS total, COUNT(*) AS n
-		    FROM hot_pending GROUP BY account_id
+		    SELECT p.account_id, SUM(p.signed_amount) AS total, COUNT(*) AS n
+		    FROM hot_pending p JOIN accounts a ON a.id = p.account_id
+		    WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		    GROUP BY p.account_id
 		) p ON p.account_id = a.id
-		ORDER BY a.id`)
+		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		ORDER BY a.id`, scope.Args()...)
 	if err != nil {
 		return err
 	}
@@ -176,14 +209,15 @@ func checkAccounts(ctx context.Context, tx pgx.Tx, res *Result) error {
 	return rows.Err()
 }
 
-func checkTransfers(ctx context.Context, tx pgx.Tx, res *Result) error {
+func checkTransfers(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) error {
 	rows, err := tx.Query(ctx, `
 		SELECT e.transfer_id::text,
 		       SUM(e.amount) FILTER (WHERE e.direction = 'debit'),
 		       SUM(e.amount) FILTER (WHERE e.direction = 'credit')
-		FROM entries e
+		FROM entries e JOIN transfers t ON t.id = e.transfer_id
+		WHERE ($1 OR t.sandbox_id IS NOT DISTINCT FROM $2::text)
 		GROUP BY e.transfer_id
-		HAVING SUM(CASE WHEN e.direction = 'debit' THEN e.amount ELSE -e.amount END) <> 0`)
+		HAVING SUM(CASE WHEN e.direction = 'debit' THEN e.amount ELSE -e.amount END) <> 0`, scope.Args()...)
 	if err != nil {
 		return err
 	}
@@ -201,14 +235,15 @@ func checkTransfers(ctx context.Context, tx pgx.Tx, res *Result) error {
 	return rows.Err()
 }
 
-func checkTrialBalance(ctx context.Context, tx pgx.Tx, res *Result) error {
+func checkTrialBalance(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) error {
 	rows, err := tx.Query(ctx, `
 		SELECT a.currency,
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'debit'), 0),
 		       COALESCE(SUM(e.amount) FILTER (WHERE e.direction = 'credit'), 0)
 		FROM entries e JOIN accounts a ON a.id = e.account_id
+		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
 		GROUP BY a.currency
-		ORDER BY a.currency`)
+		ORDER BY a.currency`, scope.Args()...)
 	if err != nil {
 		return err
 	}
@@ -229,13 +264,14 @@ func checkTrialBalance(ctx context.Context, tx pgx.Tx, res *Result) error {
 // checkPending catches a pending row filed under the wrong account or with
 // the wrong sign or amount: the account check alone would see such a row as
 // two accounts drifting in opposite directions.
-func checkPending(ctx context.Context, tx pgx.Tx, res *Result) error {
+func checkPending(ctx context.Context, tx pgx.Tx, scope Scope, res *Result) error {
 	rows, err := tx.Query(ctx, `
 		SELECT p.account_id, p.signed_amount, `+signed+`
 		FROM hot_pending p
 		JOIN entries e ON e.id = p.entry_id
 		JOIN accounts a ON a.id = e.account_id
-		WHERE p.account_id <> e.account_id OR p.signed_amount <> `+signed)
+		WHERE ($1 OR a.sandbox_id IS NOT DISTINCT FROM $2::text)
+		  AND (p.account_id <> e.account_id OR p.signed_amount <> `+signed+`)`, scope.Args()...)
 	if err != nil {
 		return err
 	}

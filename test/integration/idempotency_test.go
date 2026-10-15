@@ -17,7 +17,7 @@ import (
 	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
 )
 
-func redisKey(clientKey string) string { return "idem:POST /transfers:" + clientKey }
+func redisKey(clientKey string) string { return "idem:global:POST /transfers:" + clientKey }
 
 func TestRedisReplaysStoredResponse(t *testing.T) {
 	srv, _ := newServer(t, rdb)

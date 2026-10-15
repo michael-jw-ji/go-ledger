@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/michael-jw-ji/go-ledger/internal/sandbox"
 )
 
 // Service is the ledger's write and read API over Postgres.
@@ -57,6 +59,25 @@ const selectAccounts = `
 	    FROM hot_pending WHERE account_id = a.id
 	) p ON a.hot`
 
+// sandboxArg is the request's sandbox as a query argument. Unscoped requests
+// get NULL, which matches only the unscoped rows. Compare with IS NOT DISTINCT
+// FROM, which treats NULL as a value.
+func sandboxArg(ctx context.Context) any {
+	if id := sandbox.ID(ctx); id != "" {
+		return id
+	}
+	return nil
+}
+
+// scopeKey namespaces a client's idempotency key by sandbox, so two visitors
+// can use the same key without colliding.
+func scopeKey(ctx context.Context, key string) string {
+	if id := sandbox.ID(ctx); id != "" {
+		return "sb:" + id + ":" + key
+	}
+	return key
+}
+
 func scanAccount(row pgx.Row) (Account, error) {
 	var a Account
 	err := row.Scan(&a.ID, &a.Name, &a.Currency, &a.NormalBalance, &a.AllowNegative, &a.Hot,
@@ -68,16 +89,23 @@ func (s *Service) CreateAccount(ctx context.Context, in NewAccount) (Account, er
 	if err := in.Validate(); err != nil {
 		return Account{}, err
 	}
+	if sb := sandbox.ID(ctx); sb != "" {
+		// The account's foreign key needs its sandbox row to exist first.
+		if _, err := s.pool.Exec(ctx, `INSERT INTO sandboxes (id) VALUES ($1) ON CONFLICT DO NOTHING`, sb); err != nil {
+			return Account{}, err
+		}
+	}
 	return scanAccount(s.pool.QueryRow(ctx, `
-		INSERT INTO accounts (name, currency, normal_balance, allow_negative, hot)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO accounts (name, currency, normal_balance, allow_negative, hot, sandbox_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, name, currency, normal_balance, allow_negative, hot,
 		          balance, lock_version, 0::bigint, created_at`,
-		in.Name, in.Currency, string(in.NormalBalance), in.AllowNegative, in.Hot))
+		in.Name, in.Currency, string(in.NormalBalance), in.AllowNegative, in.Hot, sandboxArg(ctx)))
 }
 
 func (s *Service) GetAccount(ctx context.Context, id int64) (Account, error) {
-	a, err := scanAccount(s.pool.QueryRow(ctx, selectAccounts+` WHERE a.id = $1`, id))
+	a, err := scanAccount(s.pool.QueryRow(ctx,
+		selectAccounts+` WHERE a.id = $1 AND a.sandbox_id IS NOT DISTINCT FROM $2::text`, id, sandboxArg(ctx)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Account{}, fmt.Errorf("account %d: %w", id, ErrNotFound)
 	}
@@ -85,7 +113,8 @@ func (s *Service) GetAccount(ctx context.Context, id int64) (Account, error) {
 }
 
 func (s *Service) ListAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := s.pool.Query(ctx, selectAccounts+` ORDER BY a.id LIMIT 1000`)
+	rows, err := s.pool.Query(ctx,
+		selectAccounts+` WHERE a.sandbox_id IS NOT DISTINCT FROM $1::text ORDER BY a.id LIMIT 1000`, sandboxArg(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +135,7 @@ func (s *Service) CreateTransfer(ctx context.Context, req TransferRequest) (Tran
 	if len(fp) == 0 {
 		fp = RequestHash(req.Legs)
 	}
-	return s.post(ctx, req.IdempotencyKey, fp, req.Legs, nil)
+	return s.post(ctx, scopeKey(ctx, req.IdempotencyKey), fp, req.Legs, nil)
 }
 
 // ReverseTransfer posts the mirror image of a posted transfer. The key is
@@ -134,7 +163,7 @@ func (s *Service) ReverseTransfer(ctx context.Context, id uuid.UUID, idempotency
 	for i, e := range orig.Entries {
 		legs[i] = Leg{AccountID: e.AccountID, Direction: e.Direction.Opposite(), Amount: e.Amount}
 	}
-	key := "reverse:" + id.String() + ":" + idempotencyKey
+	key := "reverse:" + id.String() + ":" + scopeKey(ctx, idempotencyKey)
 	if len(fingerprint) == 0 {
 		empty := sha256.Sum256(nil)
 		fingerprint = empty[:]
@@ -178,11 +207,11 @@ func (s *Service) postTx(ctx context.Context, key string, hash []byte, legs []Le
 
 	t := Transfer{ID: uuid.New(), Status: StatusPending, ReversesTransferID: reverses}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO transfers (id, idempotency_key, request_hash, status, reverses_transfer_id)
-		VALUES ($1, $2, $3, 'pending', $4)
+		INSERT INTO transfers (id, idempotency_key, request_hash, status, reverses_transfer_id, sandbox_id)
+		VALUES ($1, $2, $3, 'pending', $4, $5)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING created_at`,
-		t.ID, key, hash, reverses).Scan(&t.CreatedAt)
+		t.ID, key, hash, reverses, sandboxArg(ctx)).Scan(&t.CreatedAt)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		// The key is already recorded (and committed: ON CONFLICT waited for it).
@@ -287,7 +316,7 @@ func (s *Service) applyLegs(ctx context.Context, tx pgx.Tx, transferID uuid.UUID
 	// they can be read before deciding what to lock.
 	rows, err := tx.Query(ctx, `
 		SELECT id, currency, normal_balance, allow_negative, hot
-		FROM accounts WHERE id = ANY($1)`, ids)
+		FROM accounts WHERE id = ANY($1) AND sandbox_id IS NOT DISTINCT FROM $2::text`, ids, sandboxArg(ctx))
 	if err != nil {
 		return nil, "", err
 	}
@@ -462,7 +491,7 @@ func scanEntry(r pgx.CollectableRow) (Entry, error) {
 
 func (s *Service) replay(ctx context.Context, key string, hash []byte) (Transfer, error) {
 	var stored []byte
-	t, err := s.loadTransfer(ctx, `idempotency_key = $1`, key, &stored)
+	t, err := s.loadTransfer(ctx, `idempotency_key = $1`, []any{key}, &stored)
 	if err != nil {
 		return Transfer{}, err
 	}
@@ -475,15 +504,15 @@ func (s *Service) replay(ctx context.Context, key string, hash []byte) (Transfer
 
 func (s *Service) GetTransfer(ctx context.Context, id uuid.UUID) (Transfer, error) {
 	var stored []byte
-	return s.loadTransfer(ctx, `id = $1`, id, &stored)
+	return s.loadTransfer(ctx, `id = $1 AND sandbox_id IS NOT DISTINCT FROM $2::text`, []any{id, sandboxArg(ctx)}, &stored)
 }
 
-func (s *Service) loadTransfer(ctx context.Context, where string, arg any, hash *[]byte) (Transfer, error) {
+func (s *Service) loadTransfer(ctx context.Context, where string, args []any, hash *[]byte) (Transfer, error) {
 	var t Transfer
 	var code *string
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, status, error_code, reverses_transfer_id, created_at, request_hash
-		FROM transfers WHERE `+where, arg).
+		FROM transfers WHERE `+where, args...).
 		Scan(&t.ID, &t.Status, &code, &t.ReversesTransferID, &t.CreatedAt, hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Transfer{}, fmt.Errorf("transfer: %w", ErrNotFound)

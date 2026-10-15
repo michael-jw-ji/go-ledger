@@ -111,7 +111,7 @@ func TestReversalFingerprintMatchesAcrossLayers(t *testing.T) {
 	pay := transfer(t, uniq("k"), move(funding.ID, alice.ID, 30))
 	path := "/transfers/" + pay.ID.String() + "/reverse"
 	key := uniq("idem")
-	rkey := "idem:POST " + path + ":" + key
+	rkey := "idem:global:POST " + path + ":" + key
 
 	resp, first := do(t, srv, "POST", path, key, "")
 	if resp.StatusCode != http.StatusCreated {

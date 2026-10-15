@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"sync/atomic"
+
+	"github.com/michael-jw-ji/go-ledger/internal/sandbox"
 )
 
 const (
@@ -62,12 +64,13 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 
-		// Scope the key to the endpoint, so one client key can be used for
-		// different transfers' reversals.
-		key := "idem:" + r.Method + " " + r.URL.Path + ":" + clientKey
+		ctx := r.Context()
+		// Scope the key to the sandbox and the endpoint. Two visitors can use
+		// the same client key, and one key can be used for different
+		// transfers' reversals.
+		key := "idem:" + sandboxScope(ctx) + ":" + r.Method + " " + r.URL.Path + ":" + clientKey
 		hash := Fingerprint(body)
 
-		ctx := r.Context()
 		existing, token, err := m.store.Claim(ctx, key, hash)
 		if err != nil {
 			m.report(ResultRedisError)
@@ -119,6 +122,15 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		w.WriteHeader(rec.status)
 		_, _ = w.Write(rec.body.Bytes())
 	})
+}
+
+// sandboxScope names the sandbox part of a Redis key. Unscoped requests share
+// the name "global".
+func sandboxScope(ctx context.Context) string {
+	if id := sandbox.ID(ctx); id != "" {
+		return id
+	}
+	return "global"
 }
 
 func (m *Middleware) report(result string) {

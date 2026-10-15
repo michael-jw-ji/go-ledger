@@ -26,11 +26,13 @@ import (
 
 	"github.com/michael-jw-ji/go-ledger/internal/httpapi"
 	"github.com/michael-jw-ji/go-ledger/internal/idempotency"
+	"github.com/michael-jw-ji/go-ledger/internal/invariants"
 	"github.com/michael-jw-ji/go-ledger/internal/ledger"
 	"github.com/michael-jw-ji/go-ledger/internal/metrics"
 	"github.com/michael-jw-ji/go-ledger/internal/outbox"
 	"github.com/michael-jw-ji/go-ledger/internal/recon"
 	"github.com/michael-jw-ji/go-ledger/internal/rollup"
+	"github.com/michael-jw-ji/go-ledger/internal/sandbox"
 	"github.com/michael-jw-ji/go-ledger/migrations"
 )
 
@@ -140,6 +142,7 @@ func serve(log *slog.Logger) error {
 	mux := httpapi.New(svc, log, idem)
 	mux.Handle("GET /metrics", m.Handler())
 	mux.HandleFunc("GET /reconciliation", latestRecon(pool, log))
+	mux.HandleFunc("GET /invariants", invariants.Handler(pool, log))
 
 	var workers sync.WaitGroup
 	reconWorker := &recon.Worker{Pool: pool, Interval: reconInterval, Log: log, OnResult: m.OnRecon}
@@ -156,7 +159,7 @@ func serve(log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              listenAddr(),
-		Handler:           withConsole(m.Instrument(mux), os.Getenv("WEB_DIR")),
+		Handler:           withConsole(sandbox.Middleware(m.Instrument(mux)), os.Getenv("WEB_DIR")),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,

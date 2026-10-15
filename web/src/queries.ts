@@ -36,6 +36,15 @@ export function useReconciliation() {
   })
 }
 
+/** The sandbox's invariants, polled so the panel stays live. */
+export function useInvariants() {
+  return useQuery({
+    queryKey: ['invariants'],
+    queryFn: async () => (await api.invariants()).data,
+    refetchInterval: 1000,
+  })
+}
+
 /** Refreshes everything a posting can change. */
 export function useInvalidateLedger() {
   const qc = useQueryClient()
@@ -43,6 +52,7 @@ export function useInvalidateLedger() {
     void qc.invalidateQueries({ queryKey: ['accounts'] })
     void qc.invalidateQueries({ queryKey: ['entries'] })
     void qc.invalidateQueries({ queryKey: ['transfer'] })
+    void qc.invalidateQueries({ queryKey: ['invariants'] })
   }
 }
 

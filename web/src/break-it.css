@@ -1,0 +1,77 @@
+/* Invariants panel and Break It tab. Uses the tokens from styles.css. */
+
+.invariants {
+  margin: 24px 0 8px;
+}
+
+.invariants .live {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--green);
+}
+
+.invariants .live.off {
+  color: var(--orange-dark);
+}
+
+.metric .value.ok {
+  color: var(--green);
+}
+
+.metric .value.bad {
+  color: var(--orange-dark);
+}
+
+.breaks {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.break-card p {
+  margin: 8px 0 14px;
+}
+
+.badge {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  padding: 3px 8px;
+  border: 1px solid currentColor;
+}
+
+.badge.pass {
+  color: var(--green);
+}
+
+.badge.fail {
+  color: var(--orange-dark);
+}
+
+.break-card .error {
+  color: var(--orange-dark);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+
+.break-card .result {
+  margin: 14px 0 0;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+.break-card .result dt {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-top: 10px;
+}
+
+.break-card .result dd {
+  margin: 4px 0 0;
+}
+
+.break-card .result ol {
+  margin: 0;
+  padding-left: 18px;
+}

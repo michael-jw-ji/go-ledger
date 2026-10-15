@@ -15,6 +15,16 @@ A double-entry payments ledger in Go and Postgres, built to show payments correc
 
 ![Test console: two concurrent requests with one idempotency key. One posts, the other is replayed with the same transfer id.](docs/images/console.png)
 
+## Try to break it
+
+The [live demo](https://go-ledger.onrender.com) opens on a **Break It** tab. Each visitor works in a private sandbox, and each scenario runs a real attack against the API:
+
+- **Retry storm:** 20 identical requests at once, one idempotency key. One transfer posts; the rest replay it.
+- **Double spend:** two payments race to drain a wallet that holds $100. One posts, one is declined, and the balance never goes negative.
+- **Key reuse:** a key reused for a different amount is refused with `idempotency_key_reused`. The original request, reformatted, replays the first transfer.
+
+The invariants panel above the tabs (trial balance, held money, reconciliation, duplicate posts) polls the sandbox every second. [DESIGN.md](DESIGN.md#sandboxes-and-the-live-console) covers how sandboxes are isolated.
+
 ## Results
 
 All numbers are measured on one laptop, with the API, Postgres, Redis and k6 sharing it. They're good for comparing designs, not as capacity figures. Details are in [docs/results.md](docs/results.md).
@@ -100,6 +110,7 @@ Events go to the Redis stream `ledger.events`, one message per posted transfer o
 | `GET` | `/transfers/{id}` | |
 | `POST` | `/transfers/{id}/reverse` | `Idempotency-Key` header required. At most one successful reversal per transfer. |
 | `GET` | `/reconciliation` | Latest reconciliation run |
+| `GET` | `/invariants` | Trial balance, held money and a scoped reconciliation for the sandbox in `X-Sandbox-Id`. Records nothing. |
 | `GET` | `/metrics` | Prometheus |
 | `GET` | `/healthz` | |
 
